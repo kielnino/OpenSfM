@@ -183,6 +183,9 @@ class OpenSfMConfig:
     matching_use_filters: bool = False
     # Use segmentation information (if available) to improve matching
     matching_use_segmentation: bool = False
+    # If True, after robust RANSAC matching, use the estimated pose to find
+    # additional matches among unmatched features via epipolar-guided descriptor matching
+    matching_epipolar_guided: bool = False
 
     ##################################
     # Params for geometric estimation

@@ -1,7 +1,7 @@
 # pyre-strict
 import logging
 from timeit import default_timer as timer
-from typing import Any, Dict, Generator, List, Optional, Sized, Tuple
+from typing import Any, Dict, Generator, List, Optional, Set, Sized, Tuple
 
 import cv2
 import numpy as np
@@ -499,7 +499,7 @@ def match_robust(
     # Run robust matching
     np_matches = np.array(matches, dtype=int)
     t = timer()
-    rmatches = _match_robust_impl(
+    rmatches, _ = _match_robust_impl(
         im1,
         im2,
         features_data1.points,
@@ -549,12 +549,12 @@ def _match_robust_impl(
     camera2: pygeometry.Camera,
     data: DataSetBase,
     overriden_config: Dict[str, Any],
-) -> NDArray:
+) -> Tuple[NDArray, Optional[pygeometry.Pose]]:
     """Perform robust geometry matching on a set of matched descriptors indexes."""
     # robust matching
-    rmatches = robust_match(p1, p2, camera1, camera2, matches, overriden_config)
+    rmatches, pose = robust_match(p1, p2, camera1, camera2, matches, overriden_config)
     rmatches = np.array([[a, b] for a, b in rmatches])
-    return rmatches
+    return rmatches, pose
 
 
 def match(
@@ -596,10 +596,25 @@ def match(
 
     # Run robust matching (non guided case only)
     t = timer()
-    rmatches = _match_robust_impl(
+    rmatches, pose = _match_robust_impl(
         im1, im2, p1, p2, matches, camera1, camera2, data, overriden_config
     )
     time_robust_matching = timer() - t
+
+    # Run epipolar-guided post-matching to recover additional matches
+    time_epipolar_guided = 0.0
+    if (
+        overriden_config["matching_epipolar_guided"]
+        and pose is not None
+        and len(rmatches) >= robust_matching_min_match
+    ):
+        t = timer()
+        new_matches = _match_epipolar_guided_post_impl(
+            im1, im2, camera1, camera2, p1, p2, rmatches, pose, data, overriden_config
+        )
+        time_epipolar_guided = timer() - t
+        if len(new_matches) > 0:
+            rmatches = np.vstack([rmatches, new_matches])
 
     # From indexes in filtered sets, to indexes in original sets of features
     m1 = feature_loader.instance.load_mask(data, im1)
@@ -611,7 +626,7 @@ def match(
 
     logger.debug(
         "Matching {} and {}.  Matcher: {} ({}) "
-        "T-desc: {:1.3f} T-robust: {:1.3f} T-total: {:1.3f} "
+        "T-desc: {:1.3f} T-robust: {:1.3f} T-epipolar: {:1.3f} T-total: {:1.3f} "
         "Matches: {} Robust: {} Success: {}".format(
             im1,
             im2,
@@ -619,6 +634,7 @@ def match(
             symmetric,
             time_2d_matching,
             time_robust_matching,
+            time_epipolar_guided,
             time_total,
             len(matches),
             len(rmatches),
@@ -629,6 +645,109 @@ def match(
     if len(rmatches) < robust_matching_min_match:
         return np.array([])
     return np.array(rmatches, dtype=int)
+
+
+def _match_epipolar_guided_post_impl(
+    im1: str,
+    im2: str,
+    camera1: pygeometry.Camera,
+    camera2: pygeometry.Camera,
+    p1: NDArray,
+    p2: NDArray,
+    rmatches: NDArray,
+    pose: pygeometry.Pose,
+    data: DataSetBase,
+    overriden_config: Dict[str, Any],
+) -> NDArray:
+    """Find additional matches using epipolar geometry from a known relative pose.
+
+    After robust matching has estimated a relative pose, search for new feature
+    matches among the unmatched features of im1 using epipolar-guided brute-force
+    descriptor matching.  Only features in im1 that have no existing match in
+    *rmatches* are searched, and matches to im2 features already present in
+    *rmatches* are discarded to keep the result free of duplicates.
+
+    Args:
+        im1, im2: Image names.
+        camera1, camera2: Camera models for each image.
+        p1, p2: Feature positions (in the masked feature space) for each image.
+        rmatches: Existing robust matches as (N, 2) int array (indices into p1/p2).
+        pose: Relative pose of camera2 w.r.t. camera1 (R_cam_to_world, origin),
+            as returned by ``robust_match_calibrated``.
+        data: Dataset.
+        overriden_config: Merged configuration dictionary.
+
+    Returns:
+        New matches as an (M, 2) int array of indices into p1/p2.  Returns an
+        empty (0, 2) array when no new matches are found.
+    """
+    empty: NDArray = np.empty((0, 2), dtype=int)
+
+    segmentation_in_descriptor = overriden_config["matching_use_segmentation"]
+    features_data1 = feature_loader.instance.load_all_data(
+        data, im1, masked=True, segmentation_in_descriptor=segmentation_in_descriptor
+    )
+    features_data2 = feature_loader.instance.load_all_data(
+        data, im2, masked=True, segmentation_in_descriptor=segmentation_in_descriptor
+    )
+    if (
+        features_data1 is None
+        or features_data2 is None
+        or features_data1.descriptors is None
+        or features_data2.descriptors is None
+    ):
+        return empty
+
+    d1 = features_data1.descriptors
+    d2 = features_data2.descriptors
+
+    # Determine which im1 features still lack a match
+    matched_idx1: Set[int] = set(rmatches[:, 0].tolist()) if len(rmatches) > 0 else set()
+    unmatched_idx1 = np.array(
+        [i for i in range(len(p1)) if i not in matched_idx1], dtype=int
+    )
+    if len(unmatched_idx1) == 0:
+        return empty
+
+    # Track already-matched im2 features to avoid duplicate assignments
+    matched_idx2: Set[int] = set(rmatches[:, 1].tolist()) if len(rmatches) > 0 else set()
+
+    # Compute unit bearings for unmatched im1 features and all im2 features
+    b1_unmatched = camera1.pixel_bearing_many(p1[unmatched_idx1, :2].copy())
+    b2_all = camera2.pixel_bearing_many(p2[:, :2].copy())
+
+    # Build epipolar consistency mask (len(unmatched_idx1) × len(p2))
+    epipolar_mask = compute_inliers_bearing_epipolar(
+        b1_unmatched,
+        b2_all,
+        pose,
+        overriden_config["guided_matching_threshold"],
+    )
+
+    # Brute-force descriptor matching restricted to epipolar candidates
+    d1_unmatched = d1[unmatched_idx1]
+    new_local_matches = match_brute_force(d1_unmatched, d2, overriden_config, epipolar_mask)
+
+    if not new_local_matches:
+        return empty
+
+    # Map local unmatched indices back to global indices in p1/p2,
+    # and discard any match whose im2 feature is already used
+    new_matches = [
+        (int(unmatched_idx1[i]), int(j))
+        for i, j in new_local_matches
+        if j not in matched_idx2
+    ]
+
+    if not new_matches:
+        return empty
+
+    logger.debug(
+        "Epipolar-guided post-matching {} and {}: {} new matches found".format(
+            im1, im2, len(new_matches)
+        )
+    )
+    return np.array(new_matches, dtype=int)
 
 
 def match_words(
@@ -867,11 +986,16 @@ def robust_match_calibrated(
     camera2: pygeometry.Camera,
     matches: NDArray,
     config: Dict[str, Any],
-) -> NDArray:
-    """Filter matches by estimating the Essential matrix via RANSAC."""
+) -> Tuple[NDArray, Optional[pygeometry.Pose]]:
+    """Filter matches by estimating the Essential matrix via RANSAC.
+
+    Returns:
+        Tuple of (inlier matches, estimated relative pose of camera2 w.r.t.
+        camera1).  The pose is None when estimation fails.
+    """
 
     if len(matches) < 8:
-        return np.array([])
+        return np.array([]), None
 
     p1 = p1[matches[:, 0]][:, :2].copy()
     p2 = p2[matches[:, 1]][:, :2].copy()
@@ -884,7 +1008,7 @@ def robust_match_calibrated(
     for relax in [4, 2, 1]:
         inliers = compute_inliers_bearings(b1, b2, T[:, :3], T[:, 3], relax * threshold)
         if np.sum(inliers) < 8:
-            return np.array([])
+            return np.array([]), None
         iterations = config["five_point_refine_match_iterations"]
         T = multiview.relative_pose_optimize_nonlinear(
             b1[inliers], b2[inliers], T[:3, 3], T[:3, :3], iterations
@@ -892,7 +1016,17 @@ def robust_match_calibrated(
 
     inliers = compute_inliers_bearings(b1, b2, T[:, :3], T[:, 3], threshold)
 
-    return matches[inliers]
+    # Build a Pose from T.  By the convention in compute_inliers_bearings,
+    # T[:3, :3] is R_cam2_to_cam1 (rotation from camera2 to camera1 frame)
+    # and T[:3, 3] is the origin of camera2 expressed in camera1 frame.
+    # set_from_cam_to_world stores R and t as [R_cw | t_cw] in the
+    # cam_to_world matrix, so get_R_cam_to_world() == T[:3, :3] and
+    # get_origin() == T[:3, 3], which is what compute_inliers_bearing_epipolar
+    # expects.
+    pose = pygeometry.Pose()
+    pose.set_from_cam_to_world(T[:3, :3], T[:3, 3])
+
+    return matches[inliers], pose
 
 
 def robust_match(
@@ -902,11 +1036,16 @@ def robust_match(
     camera2: pygeometry.Camera,
     matches: NDArray,
     config: Dict[str, Any],
-) -> NDArray:
+) -> Tuple[NDArray, Optional[pygeometry.Pose]]:
     """Filter matches by fitting a geometric model.
 
     If cameras are perspective without distortion, then the Fundamental
     matrix is used.  Otherwise, we use the Essential matrix.
+
+    Returns:
+        Tuple of (inlier matches, optional relative pose).  The pose is
+        available only for the Essential-matrix (calibrated) path; it is
+        None for the Fundamental-matrix path.
     """
     if (
         camera1.projection_type in ["perspective", "brown"]
@@ -916,7 +1055,7 @@ def robust_match(
         and camera2.k1 == 0.0
         and camera2.k2 == 0.0
     ):
-        return robust_match_fundamental(p1, p2, matches, config)[1]
+        return robust_match_fundamental(p1, p2, matches, config)[1], None
     else:
         return robust_match_calibrated(p1, p2, camera1, camera2, matches, config)
 
