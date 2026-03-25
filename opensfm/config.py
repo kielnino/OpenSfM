@@ -187,9 +187,11 @@ class OpenSfMConfig:
     # additional matches among unmatched features via epipolar-guided descriptor matching
     matching_epipolar_guided: bool = False
     # If True, save debug images for epipolar matching to <data>/debug/epipolar/
-    # Each saved image shows keypoints colored by whether they pass the epipolar
-    # angle threshold, with the epipole projected onto both images and a heat-map
-    # of the per-pair epipolar-angle error.
+    # Each saved image shows keypoints colored by the fraction of compatible
+    # partners in the other image (green=tight/few = good constraint,
+    # yellow=partial, red=loose/many = degenerate/useless constraint), with the
+    # epipole projected onto both images and a heat-map of the per-pair
+    # epipolar-angle error.
     debug_epipolar_images: bool = False
 
     ##################################

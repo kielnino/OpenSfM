@@ -1117,20 +1117,60 @@ def _debug_epipolar(
 
     # Draw keypoints for im1 that appear in b1 (subset or all features).
     # p1 and p2 hold pixel coordinates in normalized coords (OpenSfM convention).
-    def draw_kpts(vis: NDArray, pts_norm: NDArray, per_feature_pass: NDArray, w: int, h: int) -> None:
+    # Color each keypoint by the *fraction* of compatible partners in the other image:
+    #   green  = few compatible partners  (tight epipolar constraint, good)
+    #   yellow = moderate fraction        (partial constraint)
+    #   red    = many compatible partners (loose/degenerate constraint, suspicious)
+    # This makes the visualization meaningful even at low overall mask densities:
+    # mask.any(axis=1) would make nearly every feature green whenever n2 is large,
+    # because even at 0.5% mask density each feature has ~5 compatible partners on
+    # average and the probability of having zero is only ~0.7%.
+    def _frac_to_bgr(frac: float) -> Tuple[int, int, int]:
+        """Map fraction-of-compatible-partners [0,1] to a BGR colour.
+
+        0.0 -> pure green  (tight constraint, desirable)
+        0.5 -> yellow
+        1.0 -> pure red    (every partner compatible, constraint useless)
+        """
+        f = float(np.clip(frac, 0.0, 1.0))
+        if f <= 0.5:
+            # green -> yellow
+            r = int(2 * f * 255)
+            g = 200
+        else:
+            # yellow -> red
+            r = 200
+            g = int((1.0 - 2 * (f - 0.5)) * 200)
+        return (0, g, r)  # BGR
+
+    def draw_kpts(vis: NDArray, pts_norm: NDArray, per_feature_frac: NDArray, w: int, h: int) -> None:
         for idx in range(len(pts_norm)):
             px = int((float(pts_norm[idx, 0]) + 0.5) * w)
             py = int((float(pts_norm[idx, 1]) + 0.5) * h)
-            color = (0, 200, 0) if per_feature_pass[idx] else (0, 0, 220)
+            color = _frac_to_bgr(per_feature_frac[idx])
             cv2.circle(vis, (px, py), 4, color, -1)
 
-    # For each feature in im1, mark it green if ANY match in im2 passes the mask.
-    pass1 = mask.any(axis=1)  # shape (n1,)
-    # For im2 features: green if ANY im1 feature can match them.
-    pass2 = mask.any(axis=0)  # shape (n2,)
+    # Fraction of compatible partners for each feature (0 = fully constrained,
+    # 1 = every candidate in the other image is compatible = constraint useless).
+    frac1 = mask.mean(axis=1).astype(float)  # shape (n1,)
+    frac2 = mask.mean(axis=0).astype(float)  # shape (n2,)
 
-    draw_kpts(vis1, p1[:n1], pass1, w1, h1)
-    draw_kpts(vis2, p2[:n2], pass2, w2, h2)
+    # Log the constraint-quality summary so it is visible without images.
+    logger.debug(
+        "[epipolar debug %s] compatible-partner fractions "
+        "im1: median=%.3f  90th=%.3f  max=%.3f  "
+        "im2: median=%.3f  90th=%.3f  max=%.3f",
+        label,
+        float(np.median(frac1)),
+        float(np.percentile(frac1, 90)),
+        float(frac1.max()),
+        float(np.median(frac2)),
+        float(np.percentile(frac2, 90)),
+        float(frac2.max()),
+    )
+
+    draw_kpts(vis1, p1[:n1], frac1, w1, h1)
+    draw_kpts(vis2, p2[:n2], frac2, w2, h2)
 
     # Draw epipole cross
     for ep, vis, w, h in [(ep1, vis1, w1, h1), (ep2, vis2, w2, h2)]:
@@ -1158,7 +1198,7 @@ def _debug_epipolar(
         # Draw legend at the bottom of each image panel
         cv2.putText(
             vis,
-            "green=pass  red=fail",
+            "green=tight  red=loose constraint",
             (10, h - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
