@@ -1,5 +1,6 @@
 # pyre-strict
 import logging
+import os
 from timeit import default_timer as timer
 from typing import Any, Dict, Generator, List, Optional, Set, Sized, Tuple
 
@@ -307,11 +308,24 @@ def _match_descriptors_guided_impl(
     if d1 is None or d2 is None:
         return dummy, dummy, dummy, matcher_type
 
+    debug_label = (
+        "guided"
+        if overriden_config.get("debug_epipolar_images", False)
+        else None
+    )
     epipolar_mask = compute_inliers_bearing_epipolar(
         bearings1,
         bearings2,
         relative_pose,
         overriden_config["guided_matching_threshold"],
+        debug_label=debug_label,
+        camera1=camera1,
+        camera2=camera2,
+        p1=features_data1.points,
+        p2=features_data2.points,
+        data=data,
+        im1=im1,
+        im2=im2,
     )
     matches = match_brute_force_symmetric(d1, d2, overriden_config, epipolar_mask)
 
@@ -717,11 +731,24 @@ def _match_epipolar_guided_post_impl(
     b2_all = camera2.pixel_bearing_many(p2[:, :2].copy())
 
     # Build epipolar consistency mask (len(unmatched_idx1) × len(p2))
+    debug_label = (
+        "post"
+        if overriden_config.get("debug_epipolar_images", False)
+        else None
+    )
     epipolar_mask = compute_inliers_bearing_epipolar(
         b1_unmatched,
         b2_all,
         pose,
         overriden_config["guided_matching_threshold"],
+        debug_label=debug_label,
+        camera1=camera1,
+        camera2=camera2,
+        p1=p1[unmatched_idx1],
+        p2=p2,
+        data=data,
+        im1=im1,
+        im2=im2,
     )
 
     # Brute-force descriptor matching restricted to epipolar candidates
@@ -957,8 +984,280 @@ def compute_inliers_bearings(
     return inliers
 
 
+def _debug_epipolar(
+    label: str,
+    b1: NDArray,
+    b2: NDArray,
+    pose: pygeometry.Pose,
+    threshold: float,
+    angle_error: NDArray,
+    mask: NDArray,
+    camera1: Optional[pygeometry.Camera],
+    camera2: Optional[pygeometry.Camera],
+    p1: Optional[NDArray],
+    p2: Optional[NDArray],
+    data: Optional[DataSetBase],
+    im1: Optional[str],
+    im2: Optional[str],
+) -> None:
+    """Save epipolar debug images and log diagnostics for a pair of images.
+
+    Draws:
+      1. A text console summary (always, via logger).
+      2. A side-by-side image where keypoints are colored green (passes
+         threshold) or red (fails), with the epipole projected onto each image
+         and a heat-map column showing the per-pair angle-error distribution.
+
+    Args:
+        label:        Short human-readable label (e.g. "guided" / "post").
+        b1, b2:       Unit bearing arrays (N1×3, N2×3) in camera coordinates.
+        pose:         Relative pose (camera2 w.r.t. camera1).
+        threshold:    Epipolar-angle threshold in radians.
+        angle_error:  Pre-computed N1×N2 angle-error matrix.
+        mask:         Boolean mask derived from angle_error < threshold.
+        camera1/2:    Camera models (may be None if not available).
+        p1/p2:        Pixel coordinates of the features (may be None).
+        data:         Dataset (may be None – disables image saving).
+        im1/im2:      Image names (may be None – disables image saving).
+    """
+    n1, n2 = b1.shape[0], b2.shape[0]
+
+    # --- Sanity checks ---------------------------------------------------------
+    norms1 = np.linalg.norm(b1, axis=1)
+    norms2 = np.linalg.norm(b2, axis=1)
+    R = pose.get_R_cam_to_world()
+    t = pose.get_origin()
+    t_norm = float(np.linalg.norm(t))
+    eye_err = float(np.linalg.norm(R @ R.T - np.eye(3)))
+
+    logger.debug(
+        "[epipolar debug %s | %s <-> %s]  "
+        "n1=%d  n2=%d  "
+        "bearing norms: b1 [%.4f, %.4f]  b2 [%.4f, %.4f]  "
+        "R orthogonality error: %.2e  |t|=%.4f  "
+        "threshold=%.4f rad  "
+        "mask density: %.1f%%  "
+        "angle_error min/median/max: %.4f / %.4f / %.4f rad",
+        label,
+        im1 or "?",
+        im2 or "?",
+        n1,
+        n2,
+        float(norms1.min()),
+        float(norms1.max()),
+        float(norms2.min()),
+        float(norms2.max()),
+        eye_err,
+        t_norm,
+        threshold,
+        100.0 * float(mask.sum()) / max(mask.size, 1),
+        float(angle_error.min()),
+        float(np.median(angle_error)),
+        float(angle_error.max()),
+    )
+
+    if t_norm < 1e-9:
+        logger.warning(
+            "[epipolar debug %s] Translation is near-zero (|t|=%.2e). "
+            "Epipolar constraint degenerate – all bearings may pass.",
+            label,
+            t_norm,
+        )
+
+    # --- Image saving ----------------------------------------------------------
+    if data is None or im1 is None or im2 is None:
+        return
+    if not hasattr(data, "data_path"):
+        return
+    if p1 is None or p2 is None or camera1 is None or camera2 is None:
+        return
+
+    try:
+        img1 = data.load_image(im1, grayscale=False)
+        img2 = data.load_image(im2, grayscale=False)
+    except Exception as exc:
+        logger.debug("[epipolar debug] Could not load images: %s", exc)
+        return
+
+    def to_bgr(img: NDArray) -> NDArray:
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return img.copy()
+
+    vis1 = to_bgr(img1)
+    vis2 = to_bgr(img2)
+    h1, w1 = vis1.shape[:2]
+    h2, w2 = vis2.shape[:2]
+
+    # Project epipole onto image1: the epipole is the projection of the
+    # translation vector (origin of camera2 in camera1 frame).
+    def _project_point(cam: pygeometry.Camera, bearing: NDArray, w: int, h: int) -> Optional[Tuple[int, int]]:
+        """Back-project a bearing to pixel coordinates."""
+        try:
+            pts = cam.project_many(bearing.reshape(1, 3))
+            if pts is None or len(pts) == 0:
+                return None
+            # pts are in normalized image coordinates [-0.5, 0.5]
+            px = int((pts[0, 0] + 0.5) * w)
+            py = int((pts[0, 1] + 0.5) * h)
+            return px, py
+        except Exception:
+            return None
+
+    # Bearing towards the epipole in camera1 = direction of t (translation).
+    t_bearing1 = t / (np.linalg.norm(t) + 1e-12)
+    ep1 = _project_point(camera1, t_bearing1, w1, h1)
+    # Epipole in camera2 = projection of camera1's origin = -R^T * t in cam2.
+    R_world_to_cam2 = R.T  # R_cam_to_world^T = R_world_to_cam2
+    t_in_cam2 = -R_world_to_cam2 @ t
+    t_bearing2 = t_in_cam2 / (np.linalg.norm(t_in_cam2) + 1e-12)
+    ep2 = _project_point(camera2, t_bearing2, w2, h2)
+
+    # Draw keypoints for im1 that appear in b1 (subset or all features).
+    # p1 and p2 hold pixel coordinates in normalized coords (OpenSfM convention).
+    def draw_kpts(vis: NDArray, pts_norm: NDArray, per_feature_pass: NDArray, w: int, h: int) -> None:
+        for idx in range(len(pts_norm)):
+            px = int((float(pts_norm[idx, 0]) + 0.5) * w)
+            py = int((float(pts_norm[idx, 1]) + 0.5) * h)
+            color = (0, 200, 0) if per_feature_pass[idx] else (0, 0, 220)
+            cv2.circle(vis, (px, py), 4, color, -1)
+
+    # For each feature in im1, mark it green if ANY match in im2 passes the mask.
+    pass1 = mask.any(axis=1)  # shape (n1,)
+    # For im2 features: green if ANY im1 feature can match them.
+    pass2 = mask.any(axis=0)  # shape (n2,)
+
+    draw_kpts(vis1, p1[:n1], pass1, w1, h1)
+    draw_kpts(vis2, p2[:n2], pass2, w2, h2)
+
+    # Draw epipole cross
+    for ep, vis, w, h in [(ep1, vis1, w1, h1), (ep2, vis2, w2, h2)]:
+        if ep is not None:
+            cx, cy = ep
+            cv2.drawMarker(
+                vis,
+                (cx, cy),
+                (255, 0, 255),
+                cv2.MARKER_CROSS,
+                30,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                vis,
+                "epipole",
+                (cx + 8, cy - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        # Draw legend at the bottom of each image panel
+        cv2.putText(
+            vis,
+            "green=pass  red=fail",
+            (10, h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # Build angle-error heat-map column (max 256 px wide)
+    hmap_w = min(256, max(64, angle_error.shape[1]))
+    hmap_h = max(h1, h2)
+    # Normalize to [0, 255] using 3x threshold as upper bound
+    ae_scaled = np.clip(angle_error / (3.0 * threshold + 1e-12), 0.0, 1.0)
+    ae_thumb = cv2.resize(
+        (ae_scaled * 255).astype(np.uint8),
+        (hmap_w, hmap_h),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    ae_color = cv2.applyColorMap(ae_thumb, cv2.COLORMAP_JET)
+    # Draw threshold line
+    thresh_x = int(hmap_w / 3.0)  # corresponds to threshold / (3*threshold)=1/3
+    cv2.line(ae_color, (thresh_x, 0), (thresh_x, hmap_h - 1), (255, 255, 255), 2)
+    cv2.putText(
+        ae_color,
+        "angle err",
+        (4, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        ae_color,
+        "white=thresh",
+        (4, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Resize images to the same height
+    target_h = max(h1, h2, hmap_h)
+
+    def _resize_h(img: NDArray, target: int) -> NDArray:
+        h, w = img.shape[:2]
+        if h == target:
+            return img
+        scale = target / h
+        return cv2.resize(img, (int(w * scale), target))
+
+    vis1_r = _resize_h(vis1, target_h)
+    vis2_r = _resize_h(vis2, target_h)
+    ae_r = _resize_h(ae_color, target_h)
+
+    combined = np.hstack([vis1_r, vis2_r, ae_r])
+
+    # Add header
+    header_h = 36
+    header = np.zeros((header_h, combined.shape[1], 3), dtype=np.uint8)
+    cv2.putText(
+        header,
+        f"{label}: {im1} <-> {im2}  mask={100*float(mask.sum())/max(mask.size,1):.1f}%  |t|={t_norm:.4f}  thr={threshold:.4f}",
+        (10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 200),
+        1,
+        cv2.LINE_AA,
+    )
+    combined = np.vstack([header, combined])
+
+    debug_dir = os.path.join(
+        data.data_path,
+        "debug",
+        "epipolar",
+        f"{im1}__{im2}",
+    )
+    os.makedirs(debug_dir, exist_ok=True)
+    out_path = os.path.join(debug_dir, f"{label}.jpg")
+    cv2.imwrite(out_path, combined)
+    logger.debug("[epipolar debug] saved %s", out_path)
+
+
 def compute_inliers_bearing_epipolar(
-    b1: NDArray, b2: NDArray, pose: pygeometry.Pose, threshold: float
+    b1: NDArray,
+    b2: NDArray,
+    pose: pygeometry.Pose,
+    threshold: float,
+    debug_label: Optional[str] = None,
+    camera1: Optional[pygeometry.Camera] = None,
+    camera2: Optional[pygeometry.Camera] = None,
+    p1: Optional[NDArray] = None,
+    p2: Optional[NDArray] = None,
+    data: Optional[DataSetBase] = None,
+    im1: Optional[str] = None,
+    im2: Optional[str] = None,
 ) -> NDArray:
     """Compute mask of epipolarly consistent bearings, given two lists of bearings
 
@@ -966,6 +1265,11 @@ def compute_inliers_bearing_epipolar(
         b1, b2: Bearings in the two images. Expected to be normalized.
         pose: Pose of the second image wrt. the first one (relative pose)
         threshold: max reprojection error in radians.
+        debug_label: If not None, call ``_debug_epipolar`` with this label.
+        camera1/2: Camera models, needed for debug image projection.
+        p1/p2: Feature pixel positions (normalized coords), needed for debug images.
+        data: Dataset, needed for loading source images for debug output.
+        im1/im2: Image names, needed for debug output paths.
     Returns:
         array: Matrix of boolean indicating inliers/outliers
     """
@@ -976,6 +1280,23 @@ def compute_inliers_bearing_epipolar(
         pose.get_origin(),
     )
     mask = symmetric_angle_error < threshold
+    if debug_label is not None:
+        _debug_epipolar(
+            debug_label,
+            b1,
+            b2,
+            pose,
+            threshold,
+            symmetric_angle_error,
+            mask,
+            camera1,
+            camera2,
+            p1,
+            p2,
+            data,
+            im1,
+            im2,
+        )
     return mask
 
 
