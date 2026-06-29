@@ -177,10 +177,31 @@ else()
     set(OPENSFM_HAVE_OPENCL OFF CACHE BOOL "OpenCL support available" FORCE)
 endif()
 
+####### CGAL (optional, for Delaunay-tetrahedralisation meshing) #######
+# When the build is driven by pip/scikit-build, cmake is invoked with a
+# CMAKE_PREFIX_PATH that points at the Python site-packages and the pip build
+# overlay but NOT the conda prefix, so find_package(CGAL) silently fails and the
+# mesher is dropped.  Add the active conda prefix so CGAL (and its gmp/mpfr/boost)
+# are found regardless of how cmake was launched.
+if(DEFINED ENV{CONDA_PREFIX})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+endif()
+find_package(CGAL QUIET)
+if(CGAL_FOUND)
+    message(STATUS "CGAL found (${CGAL_VERSION}) — Delaunay meshing enabled")
+    set(OPENSFM_HAVE_CGAL ON CACHE BOOL "CGAL support available" FORCE)
+else()
+    message(STATUS "CGAL not found — Delaunay-tetrahedralisation meshing disabled")
+    set(OPENSFM_HAVE_CGAL OFF CACHE BOOL "CGAL support available" FORCE)
+endif()
+
 ####### OpenSfM libraries #######
 add_subdirectory(foundation)
 add_subdirectory(bundle)
 add_subdirectory(dense)
+if(OPENSFM_HAVE_CGAL)
+    add_subdirectory(cgalmesh)
+endif()
 add_subdirectory(features)
 add_subdirectory(geo)
 add_subdirectory(geometry)

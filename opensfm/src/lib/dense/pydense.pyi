@@ -219,6 +219,10 @@ class SVOFuser:
     # Returns (vertices N×3 float32, normals N×3 float32, faces M×3 int32).
     def extract_mesh(self) -> tuple: ...
 
+    # Returns (ijk N×3 int32 occupied-voxel coords, tsdf N float32 weighted
+    # average; negative = inside) — the sign field for Delaunay meshing.
+    def dump_signs(self) -> tuple: ...
+
     def prune_by_visibility(
         self,
         iterations: int,

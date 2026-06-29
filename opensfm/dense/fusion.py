@@ -888,6 +888,187 @@ def _build_global_chunks(
     return units, dsm_global_extent
 
 
+def _classify_tetra_centroids(
+    centroids: NDArray,
+    points: NDArray,
+    normals: NDArray,
+    sign_ijk: List[NDArray],
+    sign_val: List[NDArray],
+    voxel_size: float,
+    tree: "Any",
+    fallback_k: int,
+) -> NDArray:
+    """Label each tetra centroid inside (1) / outside (0) for Delaunay meshing.
+
+    In-band (a fused voxel exists at the centroid): use the TSDF sign (negative
+    = inside / solid).  Out-of-band (empty space — hole interiors, free space):
+    fall back to the oriented-point pseudo-SDF, the mean dot(centroid - p_i, n_i)
+    over the ``fallback_k`` nearest fused points (negative = inside).  The
+    fallback is what bridges holes; with ``fallback_k <= 0`` out-of-band cells
+    default to outside and holes stay open.
+    """
+    nc = len(centroids)
+    inside = np.zeros(nc, dtype=bool)
+    in_band = np.zeros(nc, dtype=bool)
+
+    # Centroid → containing voxel coordinate (the SVO key).
+    cvox = np.floor(centroids / voxel_size).astype(np.int64)  # (Nc, 3)
+
+    if sign_ijk:
+        sij = np.concatenate(sign_ijk).astype(np.int64)
+        sva = np.concatenate(sign_val).astype(np.float64)
+        # Shared packing frame over both the dumped voxels and the centroids'
+        # voxels so a single int64 key identifies a voxel on both sides.
+        origin = np.minimum(sij.min(axis=0), cvox.min(axis=0))
+        span = np.maximum(sij.max(axis=0), cvox.max(axis=0)) - origin + 1
+        skey = _pack_coarse_cells(sij, origin, span)
+        order = np.argsort(skey, kind="stable")
+        uniq_key, first = np.unique(skey[order], return_index=True)
+        # one value per voxel (duplicates collapse)
+        uniq_val = sva[order][first]
+        ckey = _pack_coarse_cells(cvox, origin, span)
+        pos = np.clip(np.searchsorted(uniq_key, ckey), 0, len(uniq_key) - 1)
+        in_band = uniq_key[pos] == ckey
+        inside[in_band] = uniq_val[pos[in_band]] < 0.0
+
+    oob = ~in_band
+    if fallback_k > 0 and oob.any():
+        k = min(int(fallback_k), len(points))
+        _, idx = tree.query(centroids[oob], k=k)
+        if k == 1:
+            idx = idx[:, None]
+        diff = centroids[oob][:, None, :] - points[idx]  # (n_oob, k, 3)
+        s = np.einsum("nkj,nkj->nk", diff, normals[idx]).mean(axis=1)
+        inside[oob] = s < 0.0
+
+    return inside.astype(np.int8)
+
+
+def _visibility_rays(
+    clean_cache: Dict[str, Tuple[NDArray, NDArray, Optional[NDArray]]],
+    view_ids: List[str],
+    reconstruction: types.Reconstruction,
+    subsample: int,
+    max_rays: int,
+) -> Optional[Tuple[NDArray, NDArray]]:
+    """Camera→surface lines of sight for the Labatut-Pons visibility graph cut.
+
+    For each view, subsample its cleaned depthmap, back-project the valid pixels
+    to world points (the observed surface) and pair each with the view's camera
+    centre.  Returns ``(origins (R, 3), targets (R, 3))`` float64 — or ``None`` if
+    no rays.  Total rays are capped at ``max_rays`` (deterministic subsample).
+    """
+    origins_list: List[NDArray] = []
+    targets_list: List[NDArray] = []
+    for sid in view_ids:
+        cached = clean_cache.get(sid)
+        if cached is None:
+            continue
+        depth = cached[0]
+        h, w = depth.shape
+        rr, cc = np.meshgrid(
+            np.arange(0, h, subsample), np.arange(0, w, subsample),
+            indexing="ij",
+        )
+        rr = rr.ravel()
+        cc = cc.ravel()
+        d = depth[rr, cc]
+        valid = d > 0
+        rr, cc, d = rr[valid], cc[valid], d[valid]
+        if len(d) == 0:
+            continue
+        shot = reconstruction.shots[sid]
+        K = shot.camera.get_K_in_pixel_coordinates(w, h)
+        R = shot.pose.get_rotation_matrix()
+        t = shot.pose.translation
+        Kinv = np.linalg.inv(K)
+        pix = np.vstack(
+            [cc.astype(np.float64), rr.astype(np.float64), np.ones(len(d))]
+        )
+        world = (R.T @ (Kinv @ pix * d - t[:, None])).T  # (M, 3)
+        cam_center = -R.T @ t  # (3,)
+        origins_list.append(np.broadcast_to(cam_center, world.shape).copy())
+        targets_list.append(world)
+
+    if not targets_list:
+        return None
+    origins = np.concatenate(origins_list)
+    targets = np.concatenate(targets_list)
+    if len(targets) > max_rays:
+        idx = np.random.default_rng(0).choice(
+            len(targets), size=max_rays, replace=False
+        )
+        origins, targets = origins[idx], targets[idx]
+    return origins.astype(np.float64), targets.astype(np.float64)
+
+
+def _build_delaunay_mesh(
+    points: NDArray,
+    normals: NDArray,
+    colors: NDArray,
+    sign_ijk: List[NDArray],
+    sign_val: List[NDArray],
+    voxel_size: float,
+    fallback_k: int,
+    drop_hull: bool,
+    rays: Optional[Tuple[NDArray, NDArray]] = None,
+    alpha_sign: float = 3.0,
+    alpha_vis: float = 5.0,
+    lambda_qual: float = 0.2,
+    back_eps: float = 0.0,
+    max_edge: float = 0.0,
+) -> Optional[Tuple[NDArray, NDArray, NDArray, NDArray]]:
+    """Mesh a chunk's fused points by CGAL Delaunay tetrahedralisation.
+
+    Builds the tetrahedralisation and labels each tetra inside/outside, then
+    extracts the inside↔outside boundary as a manifold mesh that bridges holes.
+    The per-cell sign oracle (TSDF in-band, oriented-point fallback) anchors the
+    complete zero-set surface; when ``rays`` are supplied the Labatut-Pons
+    visibility term additionally carves the free space the cameras see (so seen
+    concavities are not filled), as a hybrid graph cut over the two.  Vertices are
+    a subset of the input points (Delaunay adds none), so per-vertex colour and
+    normal are transferred from the nearest fused point.  Returns ``(verts f32,
+    normals f32, colors u8, faces i32)`` or ``None`` (degenerate / empty).
+    """
+    from scipy.spatial import cKDTree
+
+    from opensfm import pycgalmesh
+
+    pts = np.ascontiguousarray(points, dtype=np.float64)
+    mesher = pycgalmesh.DelaunayMesher(pts)
+    if mesher.num_cells == 0:  # degenerate (e.g. coplanar) — no tetrahedra
+        return None
+    tree = cKDTree(pts)
+    # Sign oracle: the complete-surface data term (and the standalone fallback).
+    centroids = mesher.cell_centroids()
+    sign = _classify_tetra_centroids(
+        centroids, pts, normals, sign_ijk, sign_val, voxel_size, tree,
+        fallback_k,
+    )
+    if rays is not None and len(rays[1]) > 0:
+        labels = mesher.graphcut_labels(
+            rays[0], rays[1], sign, alpha_sign, alpha_vis, lambda_qual, back_eps,
+        )
+    else:
+        labels = sign
+    logger.info(
+        "Delaunay: %d tetrahedra → %d inside, %d outside (sign prior: %d in)",
+        mesher.num_cells, int(np.count_nonzero(labels == 1)),
+        int(np.count_nonzero(labels == 0)), int(np.count_nonzero(sign == 1)),
+    )
+    verts, faces = mesher.extract_surface(labels, drop_hull, max_edge)
+    if len(faces) == 0:
+        return None
+    # Output vertices are exact copies of input points → nearest = identity.
+    _, idx = tree.query(verts)
+    return (
+        verts.astype(np.float32),
+        normals[idx].astype(np.float32),
+        colors[idx].astype(np.uint8),
+        faces.astype(np.int32),
+    )
+
+
 def fuse_chunks(
     data: UndistortedDataSet,
     processable: List[str],
@@ -1169,13 +1350,20 @@ def fuse_chunks(
         all_points: List[NDArray] = []
         all_normals: List[NDArray] = []
         all_colors: List[NDArray] = []
-        # Per-sub-volume mesh fragments (Surface Nets of the TSDF), accumulated
-        # like the point cloud; faces are re-indexed at write time.
+        # 3-D mesh: the chunk is meshed ONCE (after the sub-volume loop) by
+        # Delaunay tetrahedralisation of its fused points.  Per sub-volume we only
+        # export the TSDF sign field (occupied voxel coord + value) while its
+        # fuser is alive; the accumulated signs are the in-band term of the
+        # inside/outside oracle that labels each tetra.  ``all_m*`` hold the
+        # single resulting fragment so the existing batch-save path is reused.
         mesh_enabled = config["depthmap_fusion_mesh_enabled"]
         all_mverts: List[NDArray] = []
         all_mnormals: List[NDArray] = []
         all_mcolors: List[NDArray] = []
         all_mfaces: List[NDArray] = []
+        # Chunk-level TSDF sign field accumulated across the sub-volumes.
+        mesh_sign_ijk: List[NDArray] = []
+        mesh_sign_val: List[NDArray] = []
         # Leaf sub-volumes actually fused (post-split), for the Pass 2 ortho
         # bake; owner_grid[cell] = index into `leaves` of the leaf that won the
         # cell's height (MAX-z), so each cell is re-coloured by the views that
@@ -1514,52 +1702,18 @@ def fuse_chunks(
                     f"    → {len(pts)} points extracted"
                 )
 
-            # --- Surface Nets mesh (TSDF zero-set) for this sub-volume. ---
-            # Must run while `fuser` is still alive (before release/del below):
-            # extract the dual-contour mesh, keep the triangles this sub-volume
-            # owns, then bake per-vertex colour with the same multi-view IRLS
-            # consensus used for the point cloud.
+            # --- TSDF sign export for the chunk's Delaunay mesh. ---
+            # Must run while `fuser` is alive (before release/del below): the
+            # chunk is meshed once, after all its sub-volumes are fused, by
+            # Delaunay tetrahedralisation of the fused points; here we only stash
+            # the per-voxel sign field (occupied voxel coord + value) that labels
+            # each tetra in-band.  Overlap across sub-volumes is harmless — the
+            # classifier keys by voxel coord.
             if mesh_enabled:
-                mv_arr, mn_arr, mf_arr = fuser.extract_mesh()
-                mverts = np.asarray(mv_arr, dtype=np.float32)
-                mnrm = np.asarray(mn_arr, dtype=np.float32)
-                mfaces = np.asarray(mf_arr, dtype=np.int64)
-                if len(mfaces) > 0 and len(mverts) > 0:
-                    # Keep a triangle when its centroid falls in this leaf's
-                    # core AND an owned coarse cell — the same jagged-boundary
-                    # dedup as the point cloud, but on faces (dropping a shared
-                    # vertex would tear the surface).
-                    cent = mverts[mfaces].mean(axis=1)
-                    inside = np.all(
-                        (cent >= sv.core_min) & (cent <= sv.core_max), axis=1
-                    )
-                    ccells = np.floor(
-                        cent.astype(np.float64) * inv_coarse
-                    ).astype(np.int64)
-                    owned = np.isin(
-                        _pack_coarse_cells(ccells, owned_origin, owned_span),
-                        owned_keys,
-                    )
-                    mfaces = mfaces[inside & owned]
-                if len(mfaces) > 0:
-                    # Compact to referenced vertices and re-index the faces.
-                    used = np.unique(mfaces)
-                    remap = np.full(len(mverts), -1, dtype=np.int64)
-                    remap[used] = np.arange(len(used))
-                    mverts = mverts[used]
-                    mnrm = mnrm[used]
-                    mfaces = remap[mfaces].astype(np.int32)
-                    mclr = np.asarray(
-                        fuser.bake_colors(mverts, mnrm), dtype=np.uint8
-                    )
-                    all_mverts.append(mverts)
-                    all_mnormals.append(mnrm)
-                    all_mcolors.append(mclr)
-                    all_mfaces.append(mfaces)
-                    logger.info(
-                        f"    → mesh: {len(mverts)} verts, "
-                        f"{len(mfaces)} faces"
-                    )
+                sij, sval = fuser.dump_signs()
+                if len(sval) > 0:
+                    mesh_sign_ijk.append(np.asarray(sij, dtype=np.int32))
+                    mesh_sign_val.append(np.asarray(sval, dtype=np.float32))
 
             if not keep_for_bake:
                 del fuser
@@ -1706,10 +1860,21 @@ def fuse_chunks(
                             continue
                         baker.count_voxels()
                         baker.fuse_only()
+                    # The relax / DSM-occlusion buffers only matter for FILLED
+                    # cells.  When this leaf filled no holes, pass neither — so the
+                    # bake takes the exact same path as the point-cloud bake
+                    # (BakeColors with no extra buffers).  Besides skipping dead
+                    # uploads, this sidesteps an Apple-OpenCL bug where the
+                    # all-zero ``uchar`` relax buffer is misread as nonzero, which
+                    # flips every reconstructed cell into the near-nadir-only
+                    # gather path and randomly blacks out whole DSM/ortho tiles
+                    # (Linux is unaffected; the point cloud, which never passes the
+                    # buffer, is always fine).
+                    any_relax = bool(relax.any())
                     bake_out = baker.bake_colors(
                         pts, nrm, n_final=n_final, irls_iters=irls_iters,
-                        relax_occlusion=relax,
-                        dsm_occ=dsm_occ_arr,
+                        relax_occlusion=relax if any_relax else None,
+                        dsm_occ=dsm_occ_arr if any_relax else None,
                         dsm_origin_x=dsm_origin_x,
                         dsm_origin_y=dsm_origin_y,
                         dsm_gsd=dsm_gsd,
@@ -1868,6 +2033,59 @@ def fuse_chunks(
             data.save_point_cloud(
                 points, normals, colors, labels, filename=filename
             )
+
+        # --- Delaunay-tetrahedralisation mesh for this chunk. ---
+        # Tetrahedralise the chunk's fused points, label each tetra inside/
+        # outside (TSDF sign in-band, oriented-point fallback in empty space),
+        # and take the inside<->outside boundary as a watertight, hole-bridged
+        # mesh.  One Delaunay per chunk (after all its sub-volumes are fused) so
+        # the surface is seamless within the chunk.
+        if mesh_enabled and len(points) >= 4:
+            # Labatut-Pons visibility rays (camera centres → observed surface
+            # points) from this chunk's cleaned depthmaps, when graph-cut is on.
+            rays = None
+            if config["depthmap_fusion_mesh_graphcut"]:
+                rays = _visibility_rays(
+                    clean_cache, augmented, reconstruction,
+                    subsample=int(
+                        config["depthmap_fusion_mesh_graphcut_ray_subsample"]),
+                    max_rays=int(
+                        config["depthmap_fusion_mesh_graphcut_max_rays"]),
+                )
+                if rays is not None:
+                    logger.info(
+                        f"Unit {unit_idx}: {len(rays[1])} visibility rays "
+                        f"for the graph cut"
+                    )
+            mesh_frag = _build_delaunay_mesh(
+                points, normals, colors, mesh_sign_ijk, mesh_sign_val,
+                voxel_size,
+                fallback_k=int(
+                    config["depthmap_fusion_mesh_delaunay_fallback_k"]),
+                drop_hull=bool(
+                    config["depthmap_fusion_mesh_delaunay_drop_hull"]),
+                rays=rays,
+                alpha_sign=float(
+                    config["depthmap_fusion_mesh_graphcut_alpha_sign"]),
+                alpha_vis=float(
+                    config["depthmap_fusion_mesh_graphcut_alpha_vis"]),
+                lambda_qual=float(
+                    config["depthmap_fusion_mesh_graphcut_lambda"]),
+                back_eps=voxel_size * float(
+                    config["depthmap_fusion_mesh_graphcut_back_eps_voxels"]),
+                max_edge=voxel_size * float(
+                    config["depthmap_fusion_mesh_max_edge_voxels"]),
+            )
+            if mesh_frag is not None:
+                mv, mn, mc, mf = mesh_frag
+                all_mverts.append(mv)
+                all_mnormals.append(mn)
+                all_mcolors.append(mc)
+                all_mfaces.append(mf)
+                logger.info(
+                    f"Unit {unit_idx}: Delaunay mesh — "
+                    f"{len(mv)} verts, {len(mf)} faces"
+                )
 
         # Concatenate the per-sub-volume mesh fragments into this cluster's
         # mesh batch, offsetting each fragment's face indices by the running

@@ -146,6 +146,11 @@ class SVOFuser {
   void ExtractMesh(std::vector<Vec3f>* verts, std::vector<Vec3f>* normals,
                    std::vector<int>* tris);
 
+  // Dump the per-voxel sign field (occupied voxel integer coords + weighted-
+  // average TSDF, negative = inside) for the Delaunay-meshing oracle.  The
+  // caller keys by ijk and queries it at tetra-cell centroids.  After Fuse().
+  void DumpSigns(std::vector<int>* ijk, std::vector<float>* tsdf);
+
   // Legacy API: Fuse + ExtractPoints in one call (backward compat).
   void Fuse(std::vector<Vec3f>* fused_points, std::vector<Vec3f>* fused_normals,
             std::vector<Vec3<uint8_t>>* fused_colors);

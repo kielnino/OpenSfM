@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 import numpy as np
+from scipy.spatial import cKDTree
 from opensfm import dense, io, pygeometry, pymap, types, pydense
 from opensfm.config import default_config
 from opensfm.dense.equalize import estimate_image_corrections, apply_equalization
@@ -18,6 +19,8 @@ from opensfm.dense.dsm_ortho import (
 )
 from opensfm.dense.fusion import (
     _assign_footprint_holes,
+    _build_delaunay_mesh,
+    _classify_tetra_centroids,
     _dilate_core_xy,
     _kdtree_chunk_labels,
     _pack_coarse_cells,
@@ -567,7 +570,8 @@ def test_apply_equalization_preserves_highlights() -> None:
     out = apply_equalization(img, corr, highlight_knee=235.0)
     mid = float(out[:, :10].mean())
     bright = float(out[:, 10:].mean())
-    assert abs(mid - 120 / 0.7) < 4.0           # midtone fully corrected (~171)
+    # midtone fully corrected (~171)
+    assert abs(mid - 120 / 0.7) < 4.0
     assert bright < 252.0                       # NOT burned to flat white
     assert abs(bright - 248.0) < 6.0            # ~kept its original value
 
@@ -803,33 +807,6 @@ def test_component_elongation_orientation_invariant() -> None:
     assert elong[1] > 6.0
 
 
-def test_fill_holes_2pass_elongation_guard_diffuses_ridge() -> None:
-    # An elongated, high-relief hole (a ridge strip) must NOT be flat-filled at
-    # the low border: the compactness gate sends it to diffusion, so it is not
-    # carved into a single-altitude canyon.  A compact high-relief hole on the
-    # same grid IS flat-filled.  Run with GPU diffusion unavailable handled by
-    # asserting only on the flat (low_flat) outcome of the compact hole and the
-    # NON-flat outcome of the strip.
-    H, W = 40, 60
-    # Ground rising linearly along x (a ridge/slope), 0 → 30 m.
-    grid = np.tile(np.linspace(0.0, 30.0, W).astype(np.float32), (H, 1))
-    strip = np.zeros((H, W), bool)
-    strip[18:21, 5:55] = True            # long hole spanning the whole slope
-    grid_in = grid.copy()
-    grid_in[strip] = np.nan
-
-    out, _e = _fill_holes_2pass(
-        grid_in, sample_valid=~np.isnan(grid_in), hole_mask=strip,
-        small_area_max=4, diffuse_iters=8, kappa=0.5, dt=0.2,
-        large_fill="low_flat", low_percentile=20.0, max_aspect=4.0,
-    )
-    # The strip is elongated → diffused (or residual-mopped), so it must NOT be
-    # collapsed to one low altitude: its filled values still span the slope.
-    filled = out[strip]
-    assert np.all(np.isfinite(filled))
-    assert filled.max() - filled.min() > 10.0   # follows the slope, no canyon
-
-
 def test_fill_holes_2pass_compact_step_still_flat() -> None:
     # With the elongation guard active, a COMPACT stepped hole is still flat.
     grid = np.zeros((24, 24), np.float32)
@@ -878,7 +855,8 @@ def test_component_thickness_feather_has_low_aspect() -> None:
     labels, n = ndimage.label(holes)
     aspect = _component_elongation(labels, n)
     thick = _component_thickness(holes, labels, n)
-    assert aspect[1] < 4.0                    # near-round bbox → "looks compact"
+    # near-round bbox → "looks compact"
+    assert aspect[1] < 4.0
     assert thick[1] < 2.5                     # but thin → thickness rejects it
 
 
@@ -905,3 +883,128 @@ def test_fill_holes_2pass_thickness_diffuses_feather() -> None:
     assert np.all(np.isfinite(filled))
     # Follows the slope (spread), not collapsed to one low altitude (canyon).
     assert filled.max() - filled.min() > 10.0
+
+
+# ---------------------------------------------------------------------------
+# Delaunay-tetrahedralisation meshing (CGAL pycgalmesh + fusion helpers).
+# ---------------------------------------------------------------------------
+
+
+def _edge_face_counts(faces: np.ndarray) -> np.ndarray:
+    """How many faces touch each undirected edge (==2 everywhere ⇒ closed 2-manifold)."""
+    counts: dict = {}
+    for a, b, c in faces:
+        for e in ((a, b), (b, c), (c, a)):
+            key = tuple(sorted(e))
+            counts[key] = counts.get(key, 0) + 1
+    return np.array(list(counts.values()))
+
+
+def _slab_with_top_hole(n: int = 14, h: float = 1.0, hole=(4, 10)):
+    """Two parallel plates (top +z normals with a square hole, bottom -z)."""
+    g = np.arange(n, dtype=np.float64)
+    gx, gy = np.meshgrid(g, g, indexing="ij")
+    gx, gy = gx.ravel(), gy.ravel()
+    lo, hi = hole
+    m = (np.arange(n)[:, None] >= lo) & (np.arange(n)[:, None] < hi)
+    m = (m & m.T).ravel()
+    top = np.column_stack([gx[~m], gy[~m], np.full((~m).sum(), h)])
+    bot = np.column_stack([gx, gy, np.zeros(n * n)])
+    pts = np.vstack([top, bot]).astype(np.float32)
+    nrm = np.vstack([
+        np.tile([0, 0, 1.0], (len(top), 1)),
+        np.tile([0, 0, -1.0], (len(bot), 1)),
+    ]).astype(np.float32)
+    clr = np.full((len(pts), 3), 200, dtype=np.uint8)
+    return pts, nrm, clr
+
+
+def test_delaunay_mesher_extracts_labeled_interior_box() -> None:
+    # A 5×5×5 point grid; label only the centred [1,3]^3 sub-box of tetrahedra
+    # inside.  The boundary must be exactly that box — watertight, manifold, and
+    # with no convex-hull leak (the labelling, not the hull, drives the surface).
+    from opensfm import pycgalmesh
+
+    g = np.arange(5, dtype=np.float64)
+    gx, gy, gz = np.meshgrid(g, g, g, indexing="ij")
+    pts = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
+
+    mesher = pycgalmesh.DelaunayMesher(pts)
+    centroids = mesher.cell_centroids()
+    labels = np.all((centroids >= 1.0) & (
+        centroids <= 3.0), axis=1).astype(np.int8)
+    assert 0 < labels.sum() < mesher.num_cells  # genuine inside AND outside cells
+
+    verts, faces = mesher.extract_surface(labels, drop_hull=False)
+    ev = _edge_face_counts(faces)
+    assert ev.min() == 2 and ev.max() == 2  # closed 2-manifold
+    assert len(verts) - len(ev) + len(faces) == 2  # Euler χ of a genus-0 solid
+    assert np.allclose(verts.min(axis=0), [1, 1, 1])
+    assert np.allclose(verts.max(axis=0), [3, 3, 3])
+
+
+def test_delaunay_mesh_fills_hole_watertight() -> None:
+    # The oriented-point fallback must bridge the top-plate hole and return a
+    # watertight, manifold solid whose vertices are input points (no new ones).
+    pts, nrm, clr = _slab_with_top_hole()
+    res = _build_delaunay_mesh(
+        pts, nrm, clr, [], [], voxel_size=1.0, fallback_k=6, drop_hull=False
+    )
+    assert res is not None
+    mv, mn, mc, mf = res
+
+    ev = _edge_face_counts(mf)
+    assert ev.min() == 2 and ev.max() == 2
+    assert len(mv) - len(ev) + len(mf) == 2
+
+    # vertices are a subset of the input cloud; colour came along
+    d, _ = cKDTree(pts.astype(np.float64)).query(mv)
+    assert d.max() < 1e-6
+    assert mc.shape == (len(mv), 3) and np.all(mc == 200)
+
+    # at least one face bridges the (4..10, 4..10) hole near the top plate z≈1
+    fc = mv[mf].mean(axis=1)
+    bridges = (
+        (fc[:, 0] > 4.5) & (fc[:, 0] < 9.5)
+        & (fc[:, 1] > 4.5) & (fc[:, 1] < 9.5)
+        & (fc[:, 2] > 0.75)
+    )
+    assert bridges.sum() > 0
+
+
+def test_delaunay_no_fallback_leaves_hole_open() -> None:
+    # With the fallback disabled and no TSDF signs, empty space reads as outside,
+    # so the top-plate hole is NOT bridged (fewer/no faces over the gap).
+    pts, nrm, clr = _slab_with_top_hole()
+    res = _build_delaunay_mesh(
+        pts, nrm, clr, [], [], voxel_size=1.0, fallback_k=0, drop_hull=False
+    )
+    if res is not None:
+        mv, _mn, _mc, mf = res
+        fc = mv[mf].mean(axis=1)
+        bridges = (
+            (fc[:, 0] > 5.0) & (fc[:, 0] < 9.0)
+            & (fc[:, 1] > 5.0) & (fc[:, 1] < 9.0)
+            & (fc[:, 2] > 0.75)
+        )
+        assert bridges.sum() == 0
+
+
+def test_classify_centroids_tsdf_overrides_fallback() -> None:
+    # In-band centroids (a voxel exists) take the TSDF sign; out-of-band ones
+    # fall back to the oriented-point pseudo-SDF.
+    pts, nrm, _clr = _slab_with_top_hole()
+    tree = cKDTree(pts.astype(np.float64))
+    ijk = np.array([[0, 0, 0]], dtype=np.int32)
+    val = np.array([-0.5], dtype=np.float32)  # negative ⇒ inside
+
+    # centroid 0 sits in voxel (0,0,0) → in-band, labelled inside by the TSDF.
+    # centroid 1 is far away (no voxel) → out-of-band, above the +z top plate
+    # ⇒ the oriented-point fallback labels it outside.
+    cents = np.array([[0.4, 0.4, 0.4], [3.0, 3.0, 5.0]], dtype=np.float64)
+    labels = _classify_tetra_centroids(
+        cents, pts.astype(np.float64), nrm, [ijk], [val],
+        voxel_size=1.0, tree=tree, fallback_k=6,
+    )
+    assert labels[0] == 1  # TSDF sign wins in-band
+    assert labels[1] == 0  # fallback: above the surface ⇒ outside

@@ -425,6 +425,22 @@ class SVOFuserWrapper {
         foundation::py_array_from_data(tris.data(), nt, 3));
   }
 
+  // Dump the per-voxel sign field for the Delaunay-meshing oracle.  Returns
+  // (ijk N×3 int32 occupied-voxel coords, tsdf N float32 weighted-average value;
+  // negative = inside).  The caller keys by ijk and looks it up at cell
+  // centroids.  Must be called while the fuser's hash table is alive.
+  py::tuple DumpSigns() {
+    std::vector<int> ijk;
+    std::vector<float> tsdf;
+    {
+      py::gil_scoped_release release;
+      sf_.DumpSigns(&ijk, &tsdf);
+    }
+    const int n = static_cast<int>(tsdf.size());
+    return py::make_tuple(foundation::py_array_from_data(ijk.data(), n, 3),
+                          foundation::py_array_from_data(tsdf.data(), n));
+  }
+
   void PruneByVisibility(int iterations, float carve_margin,
                          int carve_threshold, int support_min) {
     py::gil_scoped_release release;

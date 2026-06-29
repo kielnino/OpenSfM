@@ -101,6 +101,13 @@ class SVOIntegratorCL {
   // Download the GPU hash table and convert to a CPU-side VoxelMap.
   VoxelMap Download() const;
 
+  // Dump the sign field for the Delaunay-meshing oracle: every occupied voxel's
+  // integer coordinate plus its weighted-average TSDF value (negative = inside,
+  // positive = outside).  Cheaper than Download() — no normal/color decode, no
+  // de-duplication (the caller keys by ijk, so duplicate hash slots are
+  // harmless).  |ijk| gets 3 ints (x, y, z) and |tsdf| 1 float per voxel.
+  void DumpSigns(std::vector<int>* ijk, std::vector<float>* tsdf) const;
+
   // Extract surface points directly on GPU — finds TSDF zero-crossings
   // in the hash table and interpolates position/normal/color.
   // Much faster than Download() + SVO::ExtractPoints() because only

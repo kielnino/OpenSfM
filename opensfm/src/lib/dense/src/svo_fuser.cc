@@ -693,4 +693,11 @@ void SVOFuser::ExtractMesh(std::vector<Vec3f>* verts,
   integrator_->ExtractMesh(min_weight_, voxel_size_, verts, normals, tris);
 }
 
+void SVOFuser::DumpSigns(std::vector<int>* ijk, std::vector<float>* tsdf) {
+  if (!integrator_) {
+    throw std::runtime_error("SVOFuser::DumpSigns: must call Fuse() first");
+  }
+  integrator_->DumpSigns(ijk, tsdf);
+}
+
 }  // namespace dense

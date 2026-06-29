@@ -526,10 +526,56 @@ class OpenSfMConfig:
     depthmap_fusion_svo_bake_reuse_max_fusers: int = 4
     # Hard ceiling, as a fraction of device VRAM, on the bytes of retained fusers (hash table + refine images) kept resident
     depthmap_fusion_svo_bake_reuse_vram_fraction: float = 0.5
-    # Extract a 3-D triangle mesh (Surface Nets / dual contouring of the fused  TSDF) alongside the fused point cloud.
-    depthmap_fusion_mesh_enabled: bool = False
+    # Extract a 3-D triangle mesh alongside the fused point cloud, by CGAL
+    # Delaunay tetrahedralisation of the fused points: each tetra is labelled
+    # inside/outside and the inside<->outside boundary is the mesh. Unlike a
+    # dual-contour mesh it bridges holes in the cloud (watertight by construction).
+    depthmap_fusion_mesh_enabled: bool = True
     # Delete the per-cluster mesh_batch_*.ply after merging into mesh.ply.
     depthmap_fusion_mesh_delete_batches: bool = True
+    # Delaunay-mesh inside/outside oracle: a tetra centroid is labelled by the
+    # fused TSDF sign where a voxel exists (the truncation band), and by an
+    # oriented-point fallback elsewhere (mean dot(centroid - p_i, normal_i) over
+    # this many nearest fused points) so empty hole interiors are labelled
+    # consistently and the hole is bridged. <=0 disables the fallback (in-band
+    # only — holes stay open).
+    depthmap_fusion_mesh_delaunay_fallback_k: int = 6
+    # Delaunay mesh: drop the facets against the outer convex hull (the infinite
+    # cell), yielding an open surface instead of a closed solid. Interior holes
+    # are still filled. False = full watertight solid.
+    depthmap_fusion_mesh_delaunay_drop_hull: bool = False
+    # Delaunay mesh: drop boundary triangles whose longest edge exceeds this many
+    # voxel sizes. These "giant" triangles span unseen free space / the convex-
+    # hull skirt that the graph cut cannot carve (e.g. flat 2.5D ground where the
+    # surface coincides with the hull top); the fine surface and reasonable hole
+    # bridges are far smaller. 0 = keep all (no size filter).
+    depthmap_fusion_mesh_max_edge_voxels: float = 16.0
+    # Delaunay mesh inside/outside labelling: use the Labatut-Pons-Keriven (ICCV
+    # 2007) visibility graph cut instead of the per-tetra sign threshold. Each
+    # camera->surface-point line of sight carves the free space in front of the
+    # observed geometry, removing the convex-hull cap and the gigantic spanning
+    # triangles a sign threshold leaves in unobserved space. Requires the cleaned
+    # depthmaps (always present in fusion).
+    depthmap_fusion_mesh_graphcut: bool = True
+    # Graph cut: weight of the per-cell SIGN data term (TSDF/oriented-point
+    # oracle) that anchors the complete zero-set surface. The visibility term
+    # then only CARVES seen free space on top of it; 0 = pure visibility (fragile
+    # on thin sheets — leaves an incomplete surface).
+    depthmap_fusion_mesh_graphcut_alpha_sign: float = 3.0
+    # Graph cut: per-ray visibility weight (carving term). Higher trusts the
+    # cameras more (sharper carving); too high can punch through thin structures.
+    depthmap_fusion_mesh_graphcut_alpha_vis: float = 5.0
+    # Graph cut: base smoothness weight on every interior facet (regularisation /
+    # minimal-surface prior; stands in for the paper's photo-consistency term).
+    depthmap_fusion_mesh_graphcut_lambda: float = 0.2
+    # Graph cut: take every Nth depth pixel per view when casting visibility rays.
+    depthmap_fusion_mesh_graphcut_ray_subsample: int = 4
+    # Graph cut: cap on total visibility rays per chunk (random subsample beyond
+    # it) — bounds the line-of-sight traversal cost / memory on dense scenes.
+    depthmap_fusion_mesh_graphcut_max_rays: int = 500_000
+    # Graph cut: how far past the surface point (in voxel-size units) the "matter"
+    # cell behind it is sampled for the inside (sink) link.
+    depthmap_fusion_mesh_graphcut_back_eps_voxels: float = 1.0
 
     ##################################
     # Params for octree point cloud tiling (viewer streaming)

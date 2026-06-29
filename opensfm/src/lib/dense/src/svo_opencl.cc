@@ -630,6 +630,45 @@ VoxelMap SVOIntegratorCL::Download() const {
   return voxels;
 }
 
+void SVOIntegratorCL::DumpSigns(std::vector<int>* ijk,
+                                std::vector<float>* tsdf) const {
+  ijk->clear();
+  tsdf->clear();
+  if (capacity_ == 0) {
+    return;
+  }
+
+  auto& dev = opencl::CLContext::Instance().Device(device_idx_);
+  auto& queue = dev.queue();
+
+  std::vector<GPUVoxelSlot> host_table(capacity_);
+  queue.enqueueReadBuffer(cl_table_, CL_TRUE, 0,
+                          capacity_ * sizeof(GPUVoxelSlot), host_table.data());
+
+  ijk->reserve(capacity_ / 4 * 3);
+  tsdf->reserve(capacity_ / 4);
+  for (uint32_t i = 0; i < capacity_; ++i) {
+    const auto& slot = host_table[i];
+    if (slot.key_ab == kEmptyKey || slot.key_c == kKeyCUninit ||
+        slot.count == 0) {
+      continue;
+    }
+    const float sw = static_cast<float>(slot.sum_weight);
+    if (sw < 1.0f) {
+      continue;  // degenerate — no meaningful weight
+    }
+    const int kx = static_cast<int>((slot.key_ab >> 16) & 0xFFFF) - 32768;
+    const int ky = static_cast<int>(slot.key_ab & 0xFFFF) - 32768;
+    const int kz = slot.key_c;
+    const float avg_tsdf =
+        static_cast<float>(slot.sum_tsdf) / (sw * static_cast<float>(kFPScale));
+    ijk->push_back(kx);
+    ijk->push_back(ky);
+    ijk->push_back(kz);
+    tsdf->push_back(avg_tsdf);
+  }
+}
+
 void SVOIntegratorCL::ExtractPoints(float min_weight, float voxel_size,
                                     uint32_t decimate_flat,
                                     float edge_threshold, int min_count,

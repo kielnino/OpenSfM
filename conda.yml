@@ -15,6 +15,7 @@ dependencies:
     - conda-forge::openblas
     - conda-forge::gperftools # [linux]
     - conda-forge::ceres-solver=2.2
+    - conda-forge::cgal-cpp=6.1.* # Delaunay-tetrahedralisation meshing (pulls boost/gmp/mpfr)
     - conda-forge::fast_float
     - conda-forge::gdal
     - conda-forge::laszip
