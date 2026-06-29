@@ -1017,6 +1017,10 @@ def _build_delaunay_mesh(
     lambda_qual: float = 0.2,
     back_eps: float = 0.0,
     max_edge: float = 0.0,
+    min_quality: float = 0.0,
+    min_component_faces: int = 0,
+    max_hole_edges: int = 0,
+    remove_self_intersections: bool = False,
 ) -> Optional[Tuple[NDArray, NDArray, NDArray, NDArray]]:
     """Mesh a chunk's fused points by CGAL Delaunay tetrahedralisation.
 
@@ -1056,7 +1060,10 @@ def _build_delaunay_mesh(
         mesher.num_cells, int(np.count_nonzero(labels == 1)),
         int(np.count_nonzero(labels == 0)), int(np.count_nonzero(sign == 1)),
     )
-    verts, faces = mesher.extract_surface(labels, drop_hull, max_edge)
+    verts, faces = mesher.extract_surface(
+        labels, drop_hull, max_edge, min_quality, min_component_faces,
+        max_hole_edges, remove_self_intersections,
+    )
     if len(faces) == 0:
         return None
     # Output vertices are exact copies of input points → nearest = identity.
@@ -1862,14 +1869,9 @@ def fuse_chunks(
                         baker.fuse_only()
                     # The relax / DSM-occlusion buffers only matter for FILLED
                     # cells.  When this leaf filled no holes, pass neither — so the
-                    # bake takes the exact same path as the point-cloud bake
-                    # (BakeColors with no extra buffers).  Besides skipping dead
-                    # uploads, this sidesteps an Apple-OpenCL bug where the
-                    # all-zero ``uchar`` relax buffer is misread as nonzero, which
-                    # flips every reconstructed cell into the near-nadir-only
-                    # gather path and randomly blacks out whole DSM/ortho tiles
-                    # (Linux is unaffected; the point cloud, which never passes the
-                    # buffer, is always fine).
+                    # bake takes the exact same minimal path as the point-cloud
+                    # bake (BakeColors with no extra buffers) and skips dead GPU
+                    # uploads.
                     any_relax = bool(relax.any())
                     bake_out = baker.bake_colors(
                         pts, nrm, n_final=n_final, irls_iters=irls_iters,
@@ -2075,6 +2077,14 @@ def fuse_chunks(
                     config["depthmap_fusion_mesh_graphcut_back_eps_voxels"]),
                 max_edge=voxel_size * float(
                     config["depthmap_fusion_mesh_max_edge_voxels"]),
+                min_quality=float(
+                    config["depthmap_fusion_mesh_min_quality"]),
+                min_component_faces=int(
+                    config["depthmap_fusion_mesh_min_component_faces"]),
+                max_hole_edges=int(
+                    config["depthmap_fusion_mesh_fill_hole_max_edges"]),
+                remove_self_intersections=bool(
+                    config["depthmap_fusion_mesh_remove_self_intersections"]),
             )
             if mesh_frag is not None:
                 mv, mn, mc, mf = mesh_frag

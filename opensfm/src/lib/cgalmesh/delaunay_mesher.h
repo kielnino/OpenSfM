@@ -20,9 +20,13 @@
 
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/Polygon_mesh_processing/border.h>
+#include <CGAL/Polygon_mesh_processing/connected_components.h>
 #include <CGAL/Polygon_mesh_processing/orient_polygon_soup.h>
 #include <CGAL/Polygon_mesh_processing/polygon_soup_to_polygon_mesh.h>
 #include <CGAL/Polygon_mesh_processing/repair_polygon_soup.h>
+#include <CGAL/Polygon_mesh_processing/repair_self_intersections.h>
+#include <CGAL/Polygon_mesh_processing/triangulate_hole.h>
 #include <CGAL/Surface_mesh.h>
 #include <CGAL/Triangulation_cell_base_with_info_3.h>
 #include <CGAL/Triangulation_vertex_base_with_info_3.h>
@@ -267,11 +271,23 @@ class DelaunayMesher {
   //                    this (world units) — removes the giant triangles that span
   //                    unseen free space / the convex-hull skirt while keeping
   //                    the fine surface and reasonable hole bridges.
+  //   min_quality    : if > 0, drop sliver / "spider-web" facets — those whose
+  //                    shortest altitude is below this fraction of their longest
+  //                    edge (2*area / longest_edge^2 < min_quality).  ~0.05.
+  //   min_component_faces : if > 0, drop connected components with fewer faces
+  //                    (removes the scattered speckle triangles).
+  //   max_hole_edges : if > 0, fill boundary holes whose cycle has at most this
+  //                    many edges (the tiny holes; the scene's outer boundary,
+  //                    a long cycle, is left open).
+  //   remove_self_intersect : if true, a final CGAL pass removes self-
+  //                    intersecting facets (folds/overlaps).
   // Returns the triangle soup, repaired + oriented into a manifold:
   //   out_verts : flat (Nv*3) double positions.
   //   out_faces : flat (Nf*3) int vertex indices (0-based into out_verts).
   void extract_surface(const int8_t* labels, std::size_t n_labels,
-                       bool drop_hull, double max_edge,
+                       bool drop_hull, double max_edge, double min_quality,
+                       int min_component_faces, int max_hole_edges,
+                       bool remove_self_intersect,
                        std::vector<double>* out_verts,
                        std::vector<int>* out_faces) const {
     if (static_cast<int>(n_labels) != num_cells_) {
@@ -329,15 +345,20 @@ class DelaunayMesher {
         const Point& p0 = vh[0]->point();
         const Point& p1 = vh[1]->point();
         const Point& p2 = vh[2]->point();
-        if (max_edge_sq > 0.0) {
-          const double e01 = (p1 - p0).squared_length();
-          const double e12 = (p2 - p1).squared_length();
-          const double e20 = (p0 - p2).squared_length();
-          if (std::max({e01, e12, e20}) > max_edge_sq) {
-            continue;  // giant triangle spanning unseen / free space
-          }
+        const double max_e_sq = std::max(
+            {(p1 - p0).squared_length(), (p2 - p1).squared_length(),
+             (p0 - p2).squared_length()});
+        if (max_edge_sq > 0.0 && max_e_sq > max_edge_sq) {
+          continue;  // giant triangle spanning unseen / free space
         }
         const Vector nrm = CGAL::cross_product(p1 - p0, p2 - p0);
+        if (min_quality > 0.0) {
+          // |nrm| == 2*area; shortest altitude = 2*area / longest_edge.
+          const double two_area = std::sqrt(nrm.squared_length());
+          if (two_area < min_quality * max_e_sq) {
+            continue;  // sliver / spider-web facet
+          }
+        }
         // Centroid of the facet, vector apex->centroid points outward.
         const Vector out_dir((p0.x() + p1.x() + p2.x()) / 3.0 - apex.x(),
                              (p0.y() + p1.y() + p2.y()) / 3.0 - apex.y(),
@@ -357,6 +378,43 @@ class DelaunayMesher {
     SurfaceMesh mesh;
     PMP::polygon_soup_to_polygon_mesh(soup_pts, soup_faces, mesh);
     mesh.collect_garbage();
+
+    // Drop scattered speckle components (and any debris the filters detached).
+    if (min_component_faces > 0) {
+      PMP::keep_large_connected_components(
+          mesh, static_cast<std::size_t>(min_component_faces));
+      mesh.collect_garbage();
+    }
+
+    // Fill the tiny holes (those whose border cycle is short); the scene's
+    // outer boundary is a long cycle and is left open.  Plain triangulation
+    // adds faces only (no new vertices), so per-vertex colour transfer in the
+    // caller stays exact.
+    if (max_hole_edges > 0) {
+      using halfedge_descriptor =
+          boost::graph_traits<SurfaceMesh>::halfedge_descriptor;
+      std::vector<halfedge_descriptor> borders;
+      PMP::extract_boundary_cycles(mesh, std::back_inserter(borders));
+      for (const halfedge_descriptor h : borders) {
+        std::size_t len = 0;
+        halfedge_descriptor hh = h;
+        do {
+          ++len;
+          hh = mesh.next(hh);
+        } while (hh != h);
+        if (len <= static_cast<std::size_t>(max_hole_edges)) {
+          PMP::triangulate_hole(mesh, h);
+        }
+      }
+      mesh.collect_garbage();
+    }
+
+    // Final topological cleanup: drop self-intersecting facets (folds the noisy
+    // cut or the hole fills can leave) so no triangle covers another.
+    if (remove_self_intersect) {
+      PMP::experimental::remove_self_intersections(mesh);
+      mesh.collect_garbage();
+    }
 
     // Flatten to verts/faces.  Surface_mesh vertex ids are contiguous after
     // collect_garbage(), so v.idx() is a dense 0..Nv-1 index.

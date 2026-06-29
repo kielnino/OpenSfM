@@ -541,15 +541,34 @@ class OpenSfMConfig:
     # only — holes stay open).
     depthmap_fusion_mesh_delaunay_fallback_k: int = 6
     # Delaunay mesh: drop the facets against the outer convex hull (the infinite
-    # cell), yielding an open surface instead of a closed solid. Interior holes
-    # are still filled. False = full watertight solid.
-    depthmap_fusion_mesh_delaunay_drop_hull: bool = False
+    # cell), yielding an OPEN top surface instead of a closed solid. With a solid
+    # interior (the sign term keeps everything below the surface inside, down to
+    # the hull) this removes the hull skirt AND the "bottom shell" of a thin slab
+    # — the cause of the overlapping/Z-fighting triangles. True is recommended;
+    # False = full watertight solid (only clean when the interior is truly thick).
+    depthmap_fusion_mesh_delaunay_drop_hull: bool = True
     # Delaunay mesh: drop boundary triangles whose longest edge exceeds this many
     # voxel sizes. These "giant" triangles span unseen free space / the convex-
     # hull skirt that the graph cut cannot carve (e.g. flat 2.5D ground where the
     # surface coincides with the hull top); the fine surface and reasonable hole
     # bridges are far smaller. 0 = keep all (no size filter).
     depthmap_fusion_mesh_max_edge_voxels: float = 16.0
+    # Delaunay mesh repair: drop sliver / "spider-web" triangles whose shortest
+    # altitude is below this fraction of their longest edge (2*area/longest^2).
+    # These near-degenerate facets fan across small gaps and survive the edge
+    # filter (their edges are short). ~0.05; 0 = keep all.
+    depthmap_fusion_mesh_min_quality: float = 0.05
+    # Delaunay mesh repair: drop connected components with fewer than this many
+    # faces (removes the scattered speckle triangles). 0 = keep all.
+    depthmap_fusion_mesh_min_component_faces: int = 50
+    # Delaunay mesh repair: fill boundary holes whose cycle has at most this many
+    # edges (the tiny holes; the scene's open outer boundary is left alone).
+    # 0 = fill none.
+    depthmap_fusion_mesh_fill_hole_max_edges: int = 30
+    # Delaunay mesh repair: final topological pass that removes self-intersecting
+    # facets (CGAL) — folds/overlaps the cut or the hole-fill can leave. Can be
+    # slow on huge meshes; disable if it dominates runtime.
+    depthmap_fusion_mesh_remove_self_intersections: bool = True
     # Delaunay mesh inside/outside labelling: use the Labatut-Pons-Keriven (ICCV
     # 2007) visibility graph cut instead of the per-tetra sign threshold. Each
     # camera->surface-point line of sight carves the free space in front of the
@@ -560,19 +579,21 @@ class OpenSfMConfig:
     # Graph cut: weight of the per-cell SIGN data term (TSDF/oriented-point
     # oracle) that anchors the complete zero-set surface. The visibility term
     # then only CARVES seen free space on top of it; 0 = pure visibility (fragile
-    # on thin sheets — leaves an incomplete surface).
-    depthmap_fusion_mesh_graphcut_alpha_sign: float = 3.0
+    # on thin sheets — leaves an incomplete surface). Strong vs the hull prior so
+    # everything below the surface stays inside (a solid interior, no thin slab).
+    depthmap_fusion_mesh_graphcut_alpha_sign: float = 5.0
     # Graph cut: per-ray visibility weight (carving term). Higher trusts the
     # cameras more (sharper carving); too high can punch through thin structures.
     depthmap_fusion_mesh_graphcut_alpha_vis: float = 5.0
     # Graph cut: base smoothness weight on every interior facet (regularisation /
     # minimal-surface prior; stands in for the paper's photo-consistency term).
-    depthmap_fusion_mesh_graphcut_lambda: float = 0.2
+    # Higher = smoother, fewer folds/wafers (but washes out fine relief).
+    depthmap_fusion_mesh_graphcut_lambda: float = 1.0
     # Graph cut: take every Nth depth pixel per view when casting visibility rays.
     depthmap_fusion_mesh_graphcut_ray_subsample: int = 4
     # Graph cut: cap on total visibility rays per chunk (random subsample beyond
     # it) — bounds the line-of-sight traversal cost / memory on dense scenes.
-    depthmap_fusion_mesh_graphcut_max_rays: int = 500_000
+    depthmap_fusion_mesh_graphcut_max_rays: int = 3_000_000
     # Graph cut: how far past the surface point (in voxel-size units) the "matter"
     # cell behind it is sampled for the inside (sink) link.
     depthmap_fusion_mesh_graphcut_back_eps_voxels: float = 1.0

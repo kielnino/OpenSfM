@@ -78,14 +78,18 @@ class DelaunayMesherPy {
   py::tuple extract_surface(
       const py::array_t<int8_t, py::array::c_style | py::array::forcecast>&
           labels,
-      bool drop_hull, double max_edge) const {
+      bool drop_hull, double max_edge, double min_quality,
+      int min_component_faces, int max_hole_edges,
+      bool remove_self_intersections) const {
     std::vector<double> verts;
     std::vector<int> faces;
     {
       py::gil_scoped_release release;
       mesher_->extract_surface(labels.data(),
                                static_cast<std::size_t>(labels.size()),
-                               drop_hull, max_edge, &verts, &faces);
+                               drop_hull, max_edge, min_quality,
+                               min_component_faces, max_hole_edges,
+                               remove_self_intersections, &verts, &faces);
     }
     const std::size_t nv = verts.size() / 3;
     const std::size_t nf = faces.size() / 3;
@@ -116,5 +120,7 @@ PYBIND11_MODULE(pycgalmesh, m) {
            py::arg("lambda_qual") = 0.1, py::arg("back_eps") = 0.0)
       .def("extract_surface", &DelaunayMesherPy::extract_surface,
            py::arg("labels"), py::arg("drop_hull") = false,
-           py::arg("max_edge") = 0.0);
+           py::arg("max_edge") = 0.0, py::arg("min_quality") = 0.0,
+           py::arg("min_component_faces") = 0, py::arg("max_hole_edges") = 0,
+           py::arg("remove_self_intersections") = false);
 }
