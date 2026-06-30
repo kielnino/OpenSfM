@@ -28,6 +28,7 @@ from .common import (
     _CLUSTER_COLORS,
     scale_down_image,
 )
+from .crop import compute_sfm_crop_hull, hull_contains
 from .dsm_ortho import (
     _dsm_footprint,
     _dsm_point_normals,
@@ -616,20 +617,32 @@ def _assign_footprint_holes(
     labels: NDArray,
     n_chunks: int,
     close_cells: int,
+    coarse_size: float = 1.0,
+    crop_hull: Optional[NDArray] = None,
     trim_fraction: float = 0.0,
 ) -> List[Set[Tuple[int, int]]]:
     """Hand every empty interior footprint column to its nearest chunk.
 
     The KD-tree partitions only OCCUPIED cells, so the empty interior of the
     scene (plazas, canopy gaps) belongs to no chunk and would never be hole-
-    filled.  We rasterise the occupied cells' XY plan, morphologically close it
-    by ``close_cells`` (bridging street/courtyard mouths up to ~2x wide) and
-    fill enclosed holes to get the completable footprint, then assign each empty
-    footprint column to the chunk of its nearest occupied cell.  Each chunk thus
-    owns — and completes — its share of the empty footprint.
+    filled.  We mark which empty coarse columns are *completable* and assign each
+    to the chunk of its nearest occupied cell, so each chunk owns — and completes
+    — a disjoint share of the empty footprint (single owner per column: no
+    double-invented fills, nothing to feather at merge).
+
+    Completability is decided by the global PCA-trimmed SfM ``crop_hull`` when
+    available: an empty column is completable iff its centre lies inside the hull
+    — the true, oriented survey outline.  This catches voids that touch the
+    ragged scene boundary (canopy edges), which ``binary_fill_holes`` treats as
+    "exterior" and drops, WITHOUT bulging into the genuine no-data corners
+    (outside the hull), and is consistent with the final SfM-hull crop.  When no
+    hull is available we fall back to the morphological enclosure (close +
+    fill-holes) of the occupied plan, which cannot complete boundary-adjacent
+    voids.
 
     ``cells_arr`` is ``(N, 3)`` occupied coarse cells, ``labels`` the chunk id
-    per cell.  Returns one ``{(x, y)}`` set of owned hole columns per chunk.
+    per cell, ``coarse_size`` the metric side of a coarse cell.  Returns one
+    ``{(x, y)}`` set of owned hole columns per chunk.
     """
     from scipy import ndimage as _ndi
     from scipy.spatial import cKDTree
@@ -645,37 +658,58 @@ def _assign_footprint_holes(
     plan = np.zeros((ph, pw), dtype=bool)
     plan[occ_xy[:, 1] - o0[1], occ_xy[:, 0] - o0[0]] = True
 
-    # Restrain the completion bounding box: cut each axis's sparse EXTREMITIES (leading/trailing rows/cols with very few occupied cells)
-    cx0, cx1 = _trim_sparse_ends(plan.sum(axis=0), trim_fraction)
-    ry0, ry1 = _trim_sparse_ends(plan.sum(axis=1), trim_fraction)
-    core = plan[ry0:ry1, cx0:cx1]
-    if not core.any():
-        return holes
-
-    if close_cells > 0:
-        n = int(close_cells)
-        padded = np.pad(core, n)
-        closed = _ndi.binary_closing(
-            padded, structure=np.ones((3, 3), dtype=bool), iterations=n
-        )[n:-n, n:-n]
+    if crop_hull is not None:
+        # Completable = empty columns whose metric centre is inside the survey
+        # hull.  Test every empty column in the occupied bbox; the corners
+        # (inside the bbox, outside the hull) are correctly rejected.
+        er, ec = np.where(~plan)
+        hx = ec + int(o0[0])  # plan-frame → global coarse XY
+        hy = er + int(o0[1])
+        # coarse cell centres, topocentric metres
+        cxm = (hx + 0.5) * coarse_size
+        cym = (hy + 0.5) * coarse_size
+        keep = hull_contains(crop_hull, cxm, cym)
+        hx = hx[keep]
+        hy = hy[keep]
+        logger.info(
+            f"Footprint territory (SfM hull): occupied={int(plan.sum())} "
+            f"cells, {len(hx)} empty in-hull column(s) of {int((~plan).sum())} "
+            f"empty in the {pw}x{ph} coarse bbox"
+        )
     else:
-        closed = core
-    footprint = _ndi.binary_fill_holes(closed)
-    hole_plan = footprint & ~core
-    logger.info(
-        f"Footprint territory: close_cells={close_cells}, "
-        f"trim={trim_fraction} ({int(plan.sum()) - int(core.sum())} fringe "
-        f"cell(s) cut), occupied={int(core.sum())} cells, "
-        f"footprint={int(footprint.sum())}, interior holes={int(hole_plan.sum())}"
-        f" (core bbox {cx1 - cx0}x{ry1 - ry0} of {pw}x{ph} coarse cells)"
-    )
-    if not hole_plan.any():
+        # Fallback: morphological enclosure of the occupied plan (legacy; cannot
+        # reach boundary-adjacent voids, but keeps interior plazas/courtyards).
+        cx0, cx1 = _trim_sparse_ends(plan.sum(axis=0), trim_fraction)
+        ry0, ry1 = _trim_sparse_ends(plan.sum(axis=1), trim_fraction)
+        core = plan[ry0:ry1, cx0:cx1]
+        if not core.any():
+            return holes
+        if close_cells > 0:
+            n = int(close_cells)
+            padded = np.pad(core, n)
+            closed = _ndi.binary_closing(
+                padded, structure=np.ones((3, 3), dtype=bool), iterations=n
+            )[n:-n, n:-n]
+        else:
+            closed = core
+        footprint = _ndi.binary_fill_holes(closed)
+        hole_plan = footprint & ~core
+        logger.info(
+            f"Footprint territory (morph): close_cells={close_cells}, "
+            f"trim={trim_fraction} ({int(plan.sum()) - int(core.sum())} fringe "
+            f"cell(s) cut), occupied={int(core.sum())} cells, "
+            f"footprint={int(footprint.sum())}, interior holes="
+            f"{int(hole_plan.sum())} (core bbox {cx1 - cx0}x{ry1 - ry0} of "
+            f"{pw}x{ph} coarse cells)"
+        )
+        hr, hc = np.where(hole_plan)
+        hx = hc + cx0 + int(o0[0])  # core-frame → global coarse XY
+        hy = hr + ry0 + int(o0[1])
+
+    if len(hx) == 0:
         return holes
 
     tree = cKDTree(cells_arr[:, :2].astype(np.float64))
-    hr, hc = np.where(hole_plan)
-    hx = hc + cx0 + int(o0[0])  # core-frame → global coarse XY
-    hy = hr + ry0 + int(o0[1])
     _, idx = tree.query(np.column_stack([hx, hy]).astype(np.float64))
     hole_labels = labels[idx]
     for x, y, lab in zip(hx, hy, hole_labels):
@@ -735,6 +769,7 @@ def _build_global_chunks(
     subsample: int = 4,
     min_observers: int = 1,
     footprint_trim: float = 0.0,
+    crop_hull: Optional[NDArray] = None,
 ) -> Tuple[
     List[_FuseUnit], Optional[Tuple[float, float, float, float, float, float]]
 ]:
@@ -827,6 +862,7 @@ def _build_global_chunks(
     # (the KD-tree only partitions reconstructed cells).
     chunk_holes = _assign_footprint_holes(
         cells_arr, labels, n_chunks, footprint_close,
+        coarse_size, crop_hull=crop_hull,
         trim_fraction=footprint_trim,
     )
     n_holes = sum(len(h) for h in chunk_holes)
@@ -935,6 +971,20 @@ def fuse_chunks(
         "Fusing %d views at %.4fm voxel size", len(fusable), voxel_size,
     )
 
+    crop_hull: Optional[NDArray] = None
+    if config["dsm_enabled"]:
+        if data.crop_hull_exists():
+            crop_hull = data.load_crop_hull()
+        else:
+            crop_hull = compute_sfm_crop_hull(
+                reconstruction, config["dense_crop_percentile"]
+            )
+        if crop_hull is not None:
+            logger.info(
+                "Hole completion bounded by SfM hull (%d vertices)",
+                len(crop_hull),
+            )
+
     # One global geometric partition: KD-tree split of the occupied coarse grid
     # into disjoint chunks, each fused by its best inverse-depth observers.
     chunk_max_cells = config["depthmap_fusion_chunk_max_cells"]
@@ -951,6 +1001,7 @@ def fuse_chunks(
         footprint_close=config["dsm_footprint_close_cells"],
         footprint_trim=config["dsm_footprint_trim_fraction"],
         min_observers=config["depthmap_fusion_min_cell_observers"],
+        crop_hull=crop_hull,
     )
     context.log_memory("fusion: chunking done")
     logger.info(f"Fusion: {len(units)} chunk(s)")
@@ -1610,6 +1661,13 @@ def fuse_chunks(
                     :, np.clip(col_c, 0, terr_w - 1)]
                 & row_ok[:, None] & col_ok[None, :]
             )
+
+            if crop_hull is not None:
+                xs = dsm_origin_x + (np.arange(dsm_w) + 0.5) * dsm_gsd
+                ys = dsm_origin_y + (np.arange(dsm_h) + 0.5) * dsm_gsd
+                terr_mask = terr_mask | hull_contains(
+                    crop_hull, xs[None, :], ys[:, None]
+                )
 
             dsm_grid, dsm_extrap = _fill_dsm_holes(
                 dsm_grid, config, footprint=terr_mask,
