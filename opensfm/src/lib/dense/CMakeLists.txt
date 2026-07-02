@@ -24,6 +24,10 @@ if(OPENSFM_HAVE_OPENCL)
         src/svo_opencl.cc
         src/svo_fuser.cc
     )
+else()
+    list(APPEND DENSE_FILES
+        src/svo_fuser_stub.cc
+    )
 endif()
 
 add_library(dense ${DENSE_FILES})
