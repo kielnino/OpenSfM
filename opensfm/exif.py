@@ -655,9 +655,9 @@ class EXIF:
                     geo["latitude"],
                     geo["longitude"],
                     geo.get("altitude", 0),
-                    float(np.degrees(ypr[0])),
-                    float(np.degrees(ypr[1])),
-                    float(np.degrees(ypr[2])),
+                    float(ypr[0]),
+                    float(ypr[1]),
+                    float(ypr[2]),
                     apply_pitch_offset,
                     tc,
                 )
