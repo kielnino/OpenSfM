@@ -6,31 +6,31 @@
   },
   "reports": [
     {
-      "branch_rate": 45.955882352941174,
-      "branches_covered": 2125,
-      "branches_valid": 4624,
-      "line_rate": 61.75003118373456,
-      "lines_covered": 9901,
-      "lines_valid": 16034,
+      "branch_rate": 45.89987052222702,
+      "branches_covered": 2127,
+      "branches_valid": 4634,
+      "line_rate": 61.733931240657704,
+      "lines_covered": 9912,
+      "lines_valid": 16056,
       "name": "coverage-python"
     },
     {
-      "branch_rate": 28.735605280404457,
-      "branches_covered": 12277,
+      "branch_rate": 28.73092407077989,
+      "branches_covered": 12275,
       "branches_valid": 42724,
-      "line_rate": 51.58397222624041,
-      "lines_covered": 14264,
+      "line_rate": 51.580355851294655,
+      "lines_covered": 14263,
       "lines_valid": 27652,
       "name": "coverage-cpp"
     }
   ],
   "total": {
-    "branch_rate": 30.41733547351525,
+    "branch_rate": 30.41091262299928,
     "branches_covered": 14402,
-    "branches_valid": 47348,
-    "line_rate": 55.315203955500614,
-    "lines_covered": 24165,
-    "lines_valid": 43686,
+    "branches_valid": 47358,
+    "line_rate": 55.310240688203535,
+    "lines_covered": 24175,
+    "lines_valid": 43708,
     "name": "total"
   }
 }
