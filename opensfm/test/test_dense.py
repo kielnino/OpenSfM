@@ -202,6 +202,54 @@ def test_assign_footprint_holes_partition_is_disjoint_and_complete() -> None:
     assert holes[0].isdisjoint(holes[1])
 
 
+def test_assign_footprint_holes_hull_completes_boundary_void() -> None:
+    # An L of occupied cells leaving the diagonal corner empty.  The void touches
+    # the scene boundary, so the morphological enclosure (binary_fill_holes)
+    # treats it as exterior and completes NOTHING — but a hull that spans the
+    # whole bbox marks those boundary-adjacent columns completable.
+    occ = [
+        (x, y, 0) for x in range(6) for y in range(6)
+        if x < 2 or y < 2  # L-shape: the 4x4 top-right block is empty
+    ]
+    cells = np.array(occ, dtype=np.int64)
+    labels = np.zeros(len(cells), dtype=np.int64)
+
+    # No hull → morphological path leaves the open corner uncompleted.
+    morph = _assign_footprint_holes(cells, labels, 1, close_cells=0)
+    assert morph[0] == set()
+
+    # Hull covering the full bbox (coarse_size=1.0, so cell centres are at
+    # x+0.5) → every empty in-bbox column is in-hull and completed.
+    hull = np.array(
+        [[-1.0, -1.0], [7.0, -1.0], [7.0, 7.0], [-1.0, 7.0]], dtype=np.float64
+    )
+    holes = _assign_footprint_holes(
+        cells, labels, 1, close_cells=0, coarse_size=1.0, crop_hull=hull
+    )
+    empty = {
+        (x, y) for x in range(6) for y in range(6) if not (x < 2 or y < 2)
+    }
+    assert holes[0] == empty
+
+
+def test_assign_footprint_holes_hull_rejects_outside_corner() -> None:
+    # Empty columns OUTSIDE the hull stay uncompleted (the no-data exterior must
+    # remain transparent — no overgrowth past the survey outline).
+    occ = [(x, y, 0) for x in range(6) for y in range(6) if x < 2 or y < 2]
+    cells = np.array(occ, dtype=np.int64)
+    labels = np.zeros(len(cells), dtype=np.int64)
+    # Hull is a tight triangle hugging the occupied L; the far corner (x,y high)
+    # is outside it.
+    hull = np.array(
+        [[-1.0, -1.0], [6.5, -1.0], [-1.0, 6.5]], dtype=np.float64
+    )
+    holes = _assign_footprint_holes(
+        cells, labels, 1, close_cells=0, coarse_size=1.0, crop_hull=hull
+    )
+    # The far corner column (5, 5) -> centre (5.5, 5.5) is outside the triangle.
+    assert (5, 5) not in holes[0]
+
+
 def test_dsm_footprint_is_extensive_with_large_close() -> None:
     # The padded closing must be EXTENSIVE — never erode the footprint inward
     # from the array border (the binary_closing border_value pitfall, which the
