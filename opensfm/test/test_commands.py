@@ -21,6 +21,7 @@ def run_command(command: ModuleType, args: List[str]) -> None:
 # @pytest.mark.slow
 def test_run_all(tmpdir: Any) -> None:
     data = data_generation.create_berlin_test_folder(tmpdir)
+    data_generation.save_config({"matcher_type": "FLANN"}, data.data_path)
     run_all_commands = [
         commands.extract_metadata,
         commands.detect_features,
