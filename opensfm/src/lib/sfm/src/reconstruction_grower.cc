@@ -145,12 +145,11 @@ map::ShotMeasurements ReconstructionGrower::ParseExifDict(const py::dict& exif,
         double longitude_std = gps["longitude_std"].cast<double>();
         double latitude_std = gps["latitude_std"].cast<double>();
         double altitude_std = gps["altitude_std"].cast<double>();
-        if (latitude_std < kEpsilon || longitude_std < kEpsilon ||
-            altitude_std < kEpsilon) {
-          longitude_std = kDefaultGpsStd[0];
-          latitude_std = kDefaultGpsStd[1];
-          altitude_std = kDefaultGpsStd[2];
-        }
+
+        if (longitude_std < kEpsilon) longitude_std = kDefaultGpsStd[0];
+        if (latitude_std < kEpsilon) latitude_std = kDefaultGpsStd[1];
+        if (altitude_std < kEpsilon) altitude_std = kDefaultGpsStd[2];
+
         gps_std = Vec3d(longitude_std, latitude_std, altitude_std);
       } else if (gps.contains("dop") && gps["dop"].cast<double>() > 0) {
         double dop = gps["dop"].cast<double>();
