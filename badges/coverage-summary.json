@@ -2,35 +2,35 @@
   "badge": {
     "color": "#fe7d37",
     "label": "coverage",
-    "message": "55.4%"
+    "message": "55.6%"
   },
   "reports": [
     {
-      "branch_rate": 45.770392749244714,
-      "branches_covered": 2121,
-      "branches_valid": 4634,
-      "line_rate": 61.87717987045341,
-      "lines_covered": 9935,
-      "lines_valid": 16056,
+      "branch_rate": 46.484874307626754,
+      "branches_covered": 2182,
+      "branches_valid": 4694,
+      "line_rate": 62.55166882596088,
+      "lines_covered": 10139,
+      "lines_valid": 16209,
       "name": "coverage-python"
     },
     {
-      "branch_rate": 28.758949880668254,
-      "branches_covered": 12291,
-      "branches_valid": 42738,
-      "line_rate": 51.59645633700958,
-      "lines_covered": 14269,
-      "lines_valid": 27655,
+      "branch_rate": 28.73216374269006,
+      "branches_covered": 12283,
+      "branches_valid": 42750,
+      "line_rate": 51.57989877078815,
+      "lines_covered": 14267,
+      "lines_valid": 27660,
       "name": "coverage-cpp"
     }
   ],
   "total": {
-    "branch_rate": 30.423034704044582,
-    "branches_covered": 14412,
-    "branches_valid": 47372,
-    "line_rate": 55.37278945803116,
-    "lines_covered": 24204,
-    "lines_valid": 43711,
+    "branch_rate": 30.488576005395835,
+    "branches_covered": 14465,
+    "branches_valid": 47444,
+    "line_rate": 55.633818869816956,
+    "lines_covered": 24406,
+    "lines_valid": 43869,
     "name": "total"
   }
 }
