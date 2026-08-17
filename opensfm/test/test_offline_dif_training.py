@@ -81,9 +81,9 @@ def test_generate_binary_cache_uses_pre_trained(tmp_path) -> None:
         # Rather than running the whole pipeline which wants descriptor loading,
         # we can verify that the pre-trained loading logic in generate_binary_cache works.
         # Let's verify that np.load indeed can load our saved arrays.
-        loaded = np.load(file_path)
-        assert np.array_equal(loaded["P"], p_fake)
-        assert np.array_equal(loaded["t"], t_fake)
+        with np.load(file_path) as loaded:
+            assert np.array_equal(loaded["P"], p_fake)
+            assert np.array_equal(loaded["t"], t_fake)
         
     finally:
         # Clean up the fake pre-trained file

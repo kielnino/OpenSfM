@@ -28,6 +28,7 @@ from .common import (
     _CLUSTER_COLORS,
     scale_down_image,
 )
+from .crop import compute_sfm_crop_hull, hull_contains
 from .dsm_ortho import (
     _dsm_footprint,
     _dsm_point_normals,
@@ -464,6 +465,97 @@ def _select_chunk_views(
     return selected, n_cells - n_sat
 
 
+def _select_chunk_views_greedy(
+    chunk_packed_sorted: NDArray,
+    weighted_sids: List[str],
+    view_ukey: Dict[str, NDArray],
+    origin: NDArray,
+    span: NDArray,
+    max_views: int,
+    min_obs: int = 1,
+) -> Tuple[List[str], int]:
+    """Pick a chunk's fusion views COVERAGE-FIRST, then fill to ``max_views``.
+
+    The naive "top-``max_views`` by inverse-depth weight" can leave chunk cells
+    whose only observers fall below the cut unfused — they become holes the
+    completion later inpaints (often as dark, view-less ground).  Instead:
+
+    Phase 1 (coverage): greedily select the view that covers the most
+    still-under-observed cells, breaking ties by inverse-depth weight, until
+    every cell has ``min_obs`` observers or the budget is spent.  ``min_obs`` > 1
+    guards against the SVO accepting nothing (it needs ``svo_min_count`` samples)
+    and against single-view outliers — each cell ends up seen by at least N
+    selected views.  This avoids exhausting the cap on many high-weight but
+    narrow views before considering a lower-weight view that covers a broad
+    uncovered region.
+
+    Phase 2 (quality fill): once the observer floor is met, top up to
+    ``max_views`` with the highest-weight views skipped as redundant.
+
+    ``chunk_packed_sorted`` is the chunk's cells as sorted packed keys (used for
+    membership + local index); ``weighted_sids`` the chunk's views sorted by
+    weight desc; ``view_ukey`` maps sid → its ``(M, 3)`` coarse cells.  Returns
+    ``(selected_sids, n_under_observed_cells)`` — coverage views first, then
+    fill.  A cell with fewer than ``min_obs`` observers in the whole candidate
+    set cannot be satisfied and is counted in the returned deficit.
+
+    Selected by ``_build_global_chunks_adaptive``
+    (``depthmap_fusion_adaptive_chunking``).
+    """
+    n_cells = len(chunk_packed_sorted)
+    min_obs = max(1, int(min_obs))
+    count = np.zeros(n_cells, dtype=np.int32)
+    n_sat = 0  # cells already seen by >= min_obs selected views
+    selected: List[str] = []
+    sel: Set[str] = set()
+
+    # Phase 1 — coverage to >= min_obs observers per cell.  Pre-project every
+    # candidate once, then solve the capped maximum-coverage problem greedily.
+    candidate_cells: Dict[str, NDArray] = {}
+    for sid in weighted_sids:
+        uk = view_ukey.get(sid)
+        if uk is None:
+            continue
+        qp = _pack_coarse_cells(uk, origin, span)
+        pos = np.clip(np.searchsorted(chunk_packed_sorted, qp), 0, n_cells - 1)
+        hit = chunk_packed_sorted[pos] == qp
+        if hit.any():
+            candidate_cells[sid] = pos[hit]
+
+    while len(selected) < max_views and n_sat < n_cells:
+        best_sid: Optional[str] = None
+        best_gain = 0
+        for sid in weighted_sids:
+            if sid in sel:
+                continue
+            local = candidate_cells.get(sid)
+            if local is None:
+                continue
+            gain = int(np.count_nonzero(count[local] < min_obs))
+            if gain > best_gain:
+                best_sid = sid
+                best_gain = gain
+        if best_sid is None:
+            break
+        local = candidate_cells[best_sid]
+        was_sat = count[local] >= min_obs
+        count[local] += 1
+        n_sat += int(np.count_nonzero((count[local] >= min_obs) & ~was_sat))
+        selected.append(best_sid)
+        sel.add(best_sid)
+
+    # Phase 2 — quality fill with the best skipped views.
+    if len(selected) < max_views:
+        for sid in weighted_sids:
+            if len(selected) >= max_views:
+                break
+            if sid not in sel:
+                selected.append(sid)
+                sel.add(sid)
+
+    return selected, n_cells - n_sat
+
+
 def _estimate_sampling_voxel_size(
     data: UndistortedDataSet,
     view_ids: List[str],
@@ -616,20 +708,32 @@ def _assign_footprint_holes(
     labels: NDArray,
     n_chunks: int,
     close_cells: int,
+    coarse_size: float = 1.0,
+    crop_hull: Optional[NDArray] = None,
     trim_fraction: float = 0.0,
 ) -> List[Set[Tuple[int, int]]]:
     """Hand every empty interior footprint column to its nearest chunk.
 
     The KD-tree partitions only OCCUPIED cells, so the empty interior of the
     scene (plazas, canopy gaps) belongs to no chunk and would never be hole-
-    filled.  We rasterise the occupied cells' XY plan, morphologically close it
-    by ``close_cells`` (bridging street/courtyard mouths up to ~2x wide) and
-    fill enclosed holes to get the completable footprint, then assign each empty
-    footprint column to the chunk of its nearest occupied cell.  Each chunk thus
-    owns — and completes — its share of the empty footprint.
+    filled.  We mark which empty coarse columns are *completable* and assign each
+    to the chunk of its nearest occupied cell, so each chunk owns — and completes
+    — a disjoint share of the empty footprint (single owner per column: no
+    double-invented fills, nothing to feather at merge).
+
+    Completability is decided by the global PCA-trimmed SfM ``crop_hull`` when
+    available: an empty column is completable iff its centre lies inside the hull
+    — the true, oriented survey outline.  This catches voids that touch the
+    ragged scene boundary (canopy edges), which ``binary_fill_holes`` treats as
+    "exterior" and drops, WITHOUT bulging into the genuine no-data corners
+    (outside the hull), and is consistent with the final SfM-hull crop.  When no
+    hull is available we fall back to the morphological enclosure (close +
+    fill-holes) of the occupied plan, which cannot complete boundary-adjacent
+    voids.
 
     ``cells_arr`` is ``(N, 3)`` occupied coarse cells, ``labels`` the chunk id
-    per cell.  Returns one ``{(x, y)}`` set of owned hole columns per chunk.
+    per cell, ``coarse_size`` the metric side of a coarse cell.  Returns one
+    ``{(x, y)}`` set of owned hole columns per chunk.
     """
     from scipy import ndimage as _ndi
     from scipy.spatial import cKDTree
@@ -645,37 +749,58 @@ def _assign_footprint_holes(
     plan = np.zeros((ph, pw), dtype=bool)
     plan[occ_xy[:, 1] - o0[1], occ_xy[:, 0] - o0[0]] = True
 
-    # Restrain the completion bounding box: cut each axis's sparse EXTREMITIES (leading/trailing rows/cols with very few occupied cells)
-    cx0, cx1 = _trim_sparse_ends(plan.sum(axis=0), trim_fraction)
-    ry0, ry1 = _trim_sparse_ends(plan.sum(axis=1), trim_fraction)
-    core = plan[ry0:ry1, cx0:cx1]
-    if not core.any():
-        return holes
-
-    if close_cells > 0:
-        n = int(close_cells)
-        padded = np.pad(core, n)
-        closed = _ndi.binary_closing(
-            padded, structure=np.ones((3, 3), dtype=bool), iterations=n
-        )[n:-n, n:-n]
+    if crop_hull is not None:
+        # Completable = empty columns whose metric centre is inside the survey
+        # hull.  Test every empty column in the occupied bbox; the corners
+        # (inside the bbox, outside the hull) are correctly rejected.
+        er, ec = np.where(~plan)
+        hx = ec + int(o0[0])  # plan-frame → global coarse XY
+        hy = er + int(o0[1])
+        # coarse cell centres, topocentric metres
+        cxm = (hx + 0.5) * coarse_size
+        cym = (hy + 0.5) * coarse_size
+        keep = hull_contains(crop_hull, cxm, cym)
+        hx = hx[keep]
+        hy = hy[keep]
+        logger.info(
+            f"Footprint territory (SfM hull): occupied={int(plan.sum())} "
+            f"cells, {len(hx)} empty in-hull column(s) of {int((~plan).sum())} "
+            f"empty in the {pw}x{ph} coarse bbox"
+        )
     else:
-        closed = core
-    footprint = _ndi.binary_fill_holes(closed)
-    hole_plan = footprint & ~core
-    logger.info(
-        f"Footprint territory: close_cells={close_cells}, "
-        f"trim={trim_fraction} ({int(plan.sum()) - int(core.sum())} fringe "
-        f"cell(s) cut), occupied={int(core.sum())} cells, "
-        f"footprint={int(footprint.sum())}, interior holes={int(hole_plan.sum())}"
-        f" (core bbox {cx1 - cx0}x{ry1 - ry0} of {pw}x{ph} coarse cells)"
-    )
-    if not hole_plan.any():
+        # Fallback: morphological enclosure of the occupied plan (legacy; cannot
+        # reach boundary-adjacent voids, but keeps interior plazas/courtyards).
+        cx0, cx1 = _trim_sparse_ends(plan.sum(axis=0), trim_fraction)
+        ry0, ry1 = _trim_sparse_ends(plan.sum(axis=1), trim_fraction)
+        core = plan[ry0:ry1, cx0:cx1]
+        if not core.any():
+            return holes
+        if close_cells > 0:
+            n = int(close_cells)
+            padded = np.pad(core, n)
+            closed = _ndi.binary_closing(
+                padded, structure=np.ones((3, 3), dtype=bool), iterations=n
+            )[n:-n, n:-n]
+        else:
+            closed = core
+        footprint = _ndi.binary_fill_holes(closed)
+        hole_plan = footprint & ~core
+        logger.info(
+            f"Footprint territory (morph): close_cells={close_cells}, "
+            f"trim={trim_fraction} ({int(plan.sum()) - int(core.sum())} fringe "
+            f"cell(s) cut), occupied={int(core.sum())} cells, "
+            f"footprint={int(footprint.sum())}, interior holes="
+            f"{int(hole_plan.sum())} (core bbox {cx1 - cx0}x{ry1 - ry0} of "
+            f"{pw}x{ph} coarse cells)"
+        )
+        hr, hc = np.where(hole_plan)
+        hx = hc + cx0 + int(o0[0])  # core-frame → global coarse XY
+        hy = hr + ry0 + int(o0[1])
+
+    if len(hx) == 0:
         return holes
 
     tree = cKDTree(cells_arr[:, :2].astype(np.float64))
-    hr, hc = np.where(hole_plan)
-    hx = hc + cx0 + int(o0[0])  # core-frame → global coarse XY
-    hy = hr + ry0 + int(o0[1])
     _, idx = tree.query(np.column_stack([hx, hy]).astype(np.float64))
     hole_labels = labels[idx]
     for x, y, lab in zip(hx, hy, hole_labels):
@@ -735,6 +860,7 @@ def _build_global_chunks(
     subsample: int = 4,
     min_observers: int = 1,
     footprint_trim: float = 0.0,
+    crop_hull: Optional[NDArray] = None,
 ) -> Tuple[
     List[_FuseUnit], Optional[Tuple[float, float, float, float, float, float]]
 ]:
@@ -827,6 +953,7 @@ def _build_global_chunks(
     # (the KD-tree only partitions reconstructed cells).
     chunk_holes = _assign_footprint_holes(
         cells_arr, labels, n_chunks, footprint_close,
+        coarse_size, crop_hull=crop_hull,
         trim_fraction=footprint_trim,
     )
     n_holes = sum(len(h) for h in chunk_holes)
@@ -856,6 +983,225 @@ def _build_global_chunks(
             # prescan (raising the budget cannot help) vs cells that DO have
             # enough but the per-chunk budget ran out before reaching them.
             n_dl = int(np.count_nonzero(cell_obs[rows] < min_observers))
+            n_data_limited += n_dl
+            n_budget_limited += n_unc - n_dl
+            n_partial_chunks += 1
+        units.append(_FuseUnit(
+            views=views, cells=chunk_cells[c], holes=chunk_holes[c],
+        ))
+    if n_partial_chunks:
+        logger.info(
+            f"View selection: {n_partial_chunks}/{n_chunks} chunk(s) under "
+            f"{min_observers} observer(s) — {n_data_limited} cell(s) DATA-limited "
+            f"(< {min_observers} views see them in the prescan; more views "
+            f"cannot help), {n_budget_limited} cell(s) BUDGET-limited (> "
+            f"{max_views} views needed)"
+        )
+
+    xy_min = cells_arr[:, :2].min(axis=0).astype(np.float64) * coarse_size
+    xy_max = (cells_arr[:, :2].max(axis=0) +
+              1).astype(np.float64) * coarse_size
+    dsm_global_extent = (
+        float(xy_min[0]), float(xy_min[1]), float(xy_max[0]), float(xy_max[1]),
+        float(cells_arr[:, 2].min()) * coarse_size,
+        float(cells_arr[:, 2].max() + 1) * coarse_size,
+    )
+    logger.info(
+        f"Global KD-tree chunking: {n_cells} occupied cells → {n_chunks} "
+        f"chunk(s) (<= {max_chunk_cells} cells each); "
+        f"{n_holes} empty footprint cell(s) assigned for completion"
+    )
+    context.log_memory("kdtree chunking: done")
+    return units, dsm_global_extent
+
+
+def _build_global_chunks_adaptive(
+    data: UndistortedDataSet,
+    reconstruction: types.Reconstruction,
+    fusable: List[str],
+    voxel_size: float,
+    coarse_factor: int,
+    max_chunk_cells: int,
+    max_views: int,
+    depth_factor: float,
+    footprint_close: int = 32,
+    subsample: int = 4,
+    min_observers: int = 1,
+    footprint_trim: float = 0.0,
+    crop_hull: Optional[NDArray] = None,
+) -> Tuple[
+    List[_FuseUnit], Optional[Tuple[float, float, float, float, float, float]]
+]:
+    """Partition the whole scene into disjoint, coverage-complete KD-tree chunks.
+
+    Adaptive variant of the global geometric assignment, selected by
+    ``depthmap_fusion_adaptive_chunking``:
+
+    1. Prescan every fusable view once (subsampled), accumulating per coarse cell
+       the summed inverse depth, and caching each view's ``(cells, weights)`` so
+       depthmaps are not reloaded for the view assignment.
+    2. KD-tree split the occupied cells into chunks of ``<= max_chunk_cells``
+       (dense, spatially coherent, disjoint by construction).
+    3. Give each chunk a capped set of observer views, chosen coverage-first by
+       greedy maximum coverage (``_select_chunk_views_greedy``).
+    4. Where the ``max_views`` cap leaves budget-limited cells — cells with
+       enough observers in the prescan but starved by the per-chunk budget —
+       recursively bisect the chunk along its longest splittable axis and retry
+       the capped selection on each half, until every cell can be covered within
+       the budget or the chunk can no longer be split geometrically.  The cell
+       size adapts to the view cap instead of accepting coverage holes.  Cells
+       with too few observers in the whole prescan (data-limited) are reported
+       but cannot be repaired by splitting.
+
+    Chunks are disjoint, so the fusion body's core clip yields unique point and
+    DSM assignment with no ownership/despeckle/outlier passes.  Returns the units
+    and the global DSM extent (from all occupied cells).
+    """
+    coarse_size = voxel_size * coarse_factor
+    inv_coarse = 1.0 / coarse_size
+
+    context.log_memory("kdtree chunking: global prescan start")
+    # (sid, cells, weights)
+    view_cells: List[Tuple[str, NDArray, NDArray]] = []
+    with ThreadPoolExecutor(
+        max_workers=max(1, int(data.config["processes"]))
+    ) as pool:
+        futures = [
+            pool.submit(
+                _prescan_view_weights, data, sid, reconstruction.shots[sid],
+                inv_coarse, depth_factor, subsample,
+            )
+            for sid in fusable
+        ]
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res is not None:
+                view_cells.append(res)
+    context.log_memory("kdtree chunking: global prescan done")
+
+    if not view_cells:
+        return [], None
+
+    cells_arr = np.unique(
+        np.concatenate([uk for _, uk, _ in view_cells]), axis=0
+    ).astype(np.int64)  # (N, 3)
+
+    # Fast global-cell lookup for observer counting and per-leaf coverage.
+    origin = cells_arr.min(axis=0)
+    span = cells_arr.max(axis=0) - origin + 1
+    packed_cells = _pack_coarse_cells(cells_arr, origin, span)
+    packed_order = np.argsort(packed_cells)
+    packed_sorted = packed_cells[packed_order]
+    n_cells = len(packed_cells)
+
+    # Count, per cell, every view that observes it in the global prescan.  This
+    # is the observer ceiling: spatial splitting cannot repair a cell with fewer
+    # than ``min_observers`` source views.
+    cell_obs = np.zeros(n_cells, dtype=np.int32)
+    for sid, ukey, w in view_cells:
+        qp = _pack_coarse_cells(ukey, origin, span)
+        pos = np.clip(np.searchsorted(packed_sorted, qp), 0, n_cells - 1)
+        hit = packed_sorted[pos] == qp
+        cell_obs[packed_order[pos[hit]]] += 1
+
+    view_ukey: Dict[str, NDArray] = {sid: uk for sid, uk, _ in view_cells}
+    view_weights: Dict[str, NDArray] = {sid: w for sid, _uk, w in view_cells}
+
+    def _select_leaf_views(rows: NDArray) -> Tuple[List[str], int]:
+        """Choose the capped best cover for one prospective KD-tree leaf."""
+        leaf_keys = np.sort(packed_cells[rows])
+        weights: Dict[str, float] = {}
+        for sid, ukey in view_ukey.items():
+            qp = _pack_coarse_cells(ukey, origin, span)
+            pos = np.clip(
+                np.searchsorted(leaf_keys, qp), 0, len(leaf_keys) - 1
+            )
+            hit = leaf_keys[pos] == qp
+            if hit.any():
+                weights[sid] = float(view_weights[sid][hit].sum())
+        weighted = sorted(weights, key=weights.get, reverse=True)
+        return _select_chunk_views_greedy(
+            leaf_keys, weighted, view_ukey, origin, span, max_views,
+            min_obs=min_observers,
+        )
+
+    def _split_rows(rows: NDArray) -> Optional[Tuple[NDArray, NDArray]]:
+        """Bisect rows along their longest splittable spatial axis."""
+        subset = cells_arr[rows]
+        spans = subset.max(axis=0) - subset.min(axis=0)
+        axis = int(np.argmax(spans))
+        if spans[axis] == 0:
+            return None
+        median = int(np.median(subset[:, axis]))
+        left = subset[:, axis] <= median
+        if not left.any() or left.all():
+            midpoint = (
+                int(subset[:, axis].min()) + int(subset[:, axis].max())
+            ) // 2
+            left = subset[:, axis] <= midpoint
+        if not left.any() or left.all():
+            return None
+        return rows[left], rows[~left]
+
+    # Start with bounded geometric KD-tree leaves, then recursively split a
+    # leaf whenever its best capped view cover leaves budget-limited cells.
+    initial_labels = _kdtree_chunk_labels(
+        cells_arr.astype(np.int32), max_chunk_cells
+    )
+    initial_order = np.argsort(initial_labels, kind="stable")
+    initial_bounds = np.searchsorted(
+        initial_labels[initial_order],
+        np.arange(int(initial_labels.max()) + 2),
+    )
+
+    leaves: List[Tuple[NDArray, List[str], int, int]] = []
+
+    def _refine_leaf(rows: NDArray) -> None:
+        views, n_unc = _select_leaf_views(rows)
+        n_data_limited = int(
+            np.count_nonzero(cell_obs[rows] < min_observers)
+        )
+        n_budget_limited = n_unc - n_data_limited
+        split = _split_rows(rows) if n_budget_limited > 0 else None
+        if split is not None:
+            _refine_leaf(split[0])
+            _refine_leaf(split[1])
+            return
+        leaves.append((rows, views, n_unc, n_data_limited))
+
+    for chunk_idx in range(len(initial_bounds) - 1):
+        _refine_leaf(
+            initial_order[initial_bounds[chunk_idx]:initial_bounds[chunk_idx + 1]]
+        )
+
+    n_chunks = len(leaves)
+    labels = np.full(n_cells, -1, dtype=np.int64)
+    chunk_cells: List[Set[Tuple[int, int, int]]] = []
+    for chunk_idx, (rows, _views, _n_unc, _n_dl) in enumerate(leaves):
+        labels[rows] = chunk_idx
+        chunk_cells.append({
+            (int(cell[0]), int(cell[1]), int(cell[2]))
+            for cell in cells_arr[rows]
+        })
+
+    # Empty interior footprint → owned by the nearest chunk so it gets completed
+    # (the KD-tree only partitions reconstructed cells).
+    chunk_holes = _assign_footprint_holes(
+        cells_arr, labels, n_chunks, footprint_close,
+        coarse_size, crop_hull=crop_hull,
+        trim_fraction=footprint_trim,
+    )
+    n_holes = sum(len(h) for h in chunk_holes)
+
+    units: List[_FuseUnit] = []
+    n_data_limited = 0    # cells with < min_observers views in the WHOLE prescan
+    n_budget_limited = 0  # cells that had enough views but the budget ran out
+    n_partial_chunks = 0
+    for c, (_rows, views, n_unc, n_dl) in enumerate(leaves):
+        if n_unc > 0:
+            # Split the deficit: cells that simply have too few observers in the
+            # prescan (raising the budget cannot help) vs cells that DO have
+            # enough but the per-chunk budget ran out before reaching them.
             n_data_limited += n_dl
             n_budget_limited += n_unc - n_dl
             n_partial_chunks += 1
@@ -935,6 +1281,20 @@ def fuse_chunks(
         "Fusing %d views at %.4fm voxel size", len(fusable), voxel_size,
     )
 
+    crop_hull: Optional[NDArray] = None
+    if config["dsm_enabled"]:
+        if data.crop_hull_exists():
+            crop_hull = data.load_crop_hull()
+        else:
+            crop_hull = compute_sfm_crop_hull(
+                reconstruction, config["dense_crop_percentile"]
+            )
+        if crop_hull is not None:
+            logger.info(
+                "Hole completion bounded by SfM hull (%d vertices)",
+                len(crop_hull),
+            )
+
     # One global geometric partition: KD-tree split of the occupied coarse grid
     # into disjoint chunks, each fused by its best inverse-depth observers.
     chunk_max_cells = config["depthmap_fusion_chunk_max_cells"]
@@ -943,15 +1303,28 @@ def fuse_chunks(
             1, config["depthmap_fusion_svo_max_voxels"] // (coarse_factor ** 3)
         )
     context.log_memory("fusion: chunking start")
-    units, dsm_global_extent = _build_global_chunks(
-        data, reconstruction, fusable,
-        voxel_size, coarse_factor,
-        chunk_max_cells, config["depthmap_max_cluster_views"],
-        depth_factor=config["dsm_territory_depth_factor"],
-        footprint_close=config["dsm_footprint_close_cells"],
-        footprint_trim=config["dsm_footprint_trim_fraction"],
-        min_observers=config["depthmap_fusion_min_cell_observers"],
-    )
+    if config["depthmap_fusion_adaptive_chunking"]:
+        units, dsm_global_extent = _build_global_chunks_adaptive(
+            data, reconstruction, fusable,
+            voxel_size, coarse_factor,
+            chunk_max_cells, config["depthmap_max_cluster_views"],
+            depth_factor=config["dsm_territory_depth_factor"],
+            footprint_close=config["dsm_footprint_close_cells"],
+            footprint_trim=config["dsm_footprint_trim_fraction"],
+            min_observers=config["depthmap_fusion_min_cell_observers"],
+            crop_hull=crop_hull,
+        )
+    else:
+        units, dsm_global_extent = _build_global_chunks(
+            data, reconstruction, fusable,
+            voxel_size, coarse_factor,
+            chunk_max_cells, config["depthmap_max_cluster_views"],
+            depth_factor=config["dsm_territory_depth_factor"],
+            footprint_close=config["dsm_footprint_close_cells"],
+            footprint_trim=config["dsm_footprint_trim_fraction"],
+            min_observers=config["depthmap_fusion_min_cell_observers"],
+            crop_hull=crop_hull,
+        )
     context.log_memory("fusion: chunking done")
     logger.info(f"Fusion: {len(units)} chunk(s)")
 
@@ -1610,6 +1983,13 @@ def fuse_chunks(
                     :, np.clip(col_c, 0, terr_w - 1)]
                 & row_ok[:, None] & col_ok[None, :]
             )
+
+            if crop_hull is not None:
+                xs = dsm_origin_x + (np.arange(dsm_w) + 0.5) * dsm_gsd
+                ys = dsm_origin_y + (np.arange(dsm_h) + 0.5) * dsm_gsd
+                terr_mask = terr_mask | hull_contains(
+                    crop_hull, xs[None, :], ys[:, None]
+                )
 
             dsm_grid, dsm_extrap = _fill_dsm_holes(
                 dsm_grid, config, footprint=terr_mask,

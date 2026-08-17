@@ -590,7 +590,7 @@ class GPUDiffuserWrapper {
 
     // Upload or compute guide
     if (guide_np.size() > 0) {
-      if (guide_np.size() != static_cast<ssize_t>(ncells_)) {
+      if (guide_np.size() != static_cast<py::ssize_t>(ncells_)) {
         throw std::invalid_argument(
             "guide must have same number of cells as grid");
       }
@@ -705,7 +705,7 @@ class GPUDiffuserWrapper {
     const int gh = static_cast<int>(dsm_np.shape(0));
     const int gw = static_cast<int>(dsm_np.shape(1));
     const size_t nc = static_cast<size_t>(gh) * gw;
-    if (guide_np.size() != static_cast<ssize_t>(nc * 3)) {
+    if (guide_np.size() != static_cast<py::ssize_t>(nc * 3)) {
       throw std::invalid_argument(
           "SnapEdges: guide must be HxWx3 matching dsm");
     }
@@ -855,7 +855,7 @@ class GPUDiffuserWrapper {
     const int gh = static_cast<int>(ortho_np.shape(0));
     const int gw = static_cast<int>(ortho_np.shape(1));
     const size_t nc = static_cast<size_t>(gh) * gw;
-    if (valid_np.size() != static_cast<ssize_t>(nc)) {
+    if (valid_np.size() != static_cast<py::ssize_t>(nc)) {
       throw std::invalid_argument(
           "GatedMedian: valid must be HxW matching ortho");
     }

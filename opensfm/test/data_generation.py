@@ -1,6 +1,9 @@
 # pyre-strict
 import os
+import shutil
 from typing import Any, Dict
+
+import sys
 
 import opensfm.dataset
 import yaml
@@ -20,7 +23,17 @@ def create_berlin_test_folder(tmpdir: Any) -> opensfm.dataset.DataSet:
     dst = str(tmpdir.mkdir("berlin"))
     files = ["images", "masks", "config.yaml", "ground_control_points.json"]
     for filename in files:
-        os.symlink(os.path.join(src, filename), os.path.join(dst, filename))
+        src_path = os.path.join(src, filename)
+        dst_path = os.path.join(dst, filename)
+        if sys.platform == "win32":
+            if os.path.isdir(src_path):
+                os.mkdir(dst_path)
+                for f in os.listdir(src_path):
+                    shutil.copyfile(os.path.join(src_path, f), os.path.join(dst_path, f))
+            else:
+                shutil.copyfile(src_path, dst_path)
+        else:
+            os.symlink(src_path, dst_path)
     return opensfm.dataset.DataSet(dst)
 
 
