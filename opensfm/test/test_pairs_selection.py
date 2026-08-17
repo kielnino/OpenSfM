@@ -1,6 +1,8 @@
 # pyre-strict
+import sys
 import argparse
 import os.path
+import shutil
 from typing import Any, Dict, Iterator
 
 import numpy as np
@@ -34,7 +36,13 @@ def lund_path(tmpdir_factory: Any) -> str:
     """
     src = os.path.join(data_generation.DATA_PATH, "lund", "images")
     path = str(tmpdir_factory.mktemp("lund"))
-    os.symlink(src, os.path.join(path, "images"))
+    dst = os.path.join(path, "images")
+    if sys.platform == "win32":
+        os.mkdir(dst)
+        for f in os.listdir(src):
+            shutil.copyfile(os.path.join(src, f), os.path.join(dst, f))
+    else:
+        os.symlink(src, dst)
 
     # Use words matcher type to support the bow retrieval test
     data_generation.save_config({"matcher_type": "WORDS"}, path)

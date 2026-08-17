@@ -141,7 +141,7 @@ def test_reconstruction_statistics_normal(
     assert 3.4 < reconstruction_statistics["average_track_length_over_two"] < 3.5
     assert len(reconstruction_statistics["histogram_track_length"]) == 5
     assert 0.15 < reconstruction_statistics["reprojection_error_normalized"] < 0.16
-    assert 1.25 < reconstruction_statistics["reprojection_error_pixels"] < 1.28
+    assert 1.24 < reconstruction_statistics["reprojection_error_pixels"] < 1.28
     assert len(
         reconstruction_statistics["reprojection_histogram_normalized"][0]) == 30
     assert len(

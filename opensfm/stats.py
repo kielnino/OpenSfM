@@ -256,11 +256,11 @@ def gcp_errors(
     # Separate GCP-only and CP-only errors
     gcp_only_errors = [
         e for e, d in zip(all_errors, [dd for dd in gcp_details if dd["error"] is not None])
-        if d["role"] == "Ground Control Point"
+        if d["role"] == "gcp"
     ]
     cp_only_errors = [
         e for e, d in zip(all_errors, [dd for dd in gcp_details if dd["error"] is not None])
-        if d["role"] == "Checkpoint"
+        if d["role"] == "checkpoint"
     ]
 
     errors = np.array(all_errors) if all_errors else np.array([])
@@ -1021,7 +1021,7 @@ def save_matchgraph(
         orientation="horizontal",
         label="Number of matches between images",
         pad=0.0,
-        ax=plt.gca(),
+        ax=ax,
     )
 
     with io_handler.open_wb(os.path.join(output_path, "matchgraph.png")) as fwb:

@@ -138,12 +138,19 @@ map::ShotMeasurements ReconstructionGrower::ParseExifDict(const py::dict& exif,
       m.gps_position_.SetValue(
           geo::TopocentricFromLla(lat, lon, alt, reflat, reflon, refalt));
 
+      constexpr double kEpsilon = 1e-8;
       Vec3d gps_std;
       if (gps.contains("latitude_std") && gps.contains("longitude_std") &&
           gps.contains("altitude_std")) {
-        gps_std = Vec3d(gps["longitude_std"].cast<double>(),
-                        gps["latitude_std"].cast<double>(),
-                        gps["altitude_std"].cast<double>());
+        double longitude_std = gps["longitude_std"].cast<double>();
+        double latitude_std = gps["latitude_std"].cast<double>();
+        double altitude_std = gps["altitude_std"].cast<double>();
+
+        if (longitude_std < kEpsilon) longitude_std = kDefaultGpsStd[0];
+        if (latitude_std < kEpsilon) latitude_std = kDefaultGpsStd[1];
+        if (altitude_std < kEpsilon) altitude_std = kDefaultGpsStd[2];
+
+        gps_std = Vec3d(longitude_std, latitude_std, altitude_std);
       } else if (gps.contains("dop") && gps["dop"].cast<double>() > 0) {
         double dop = gps["dop"].cast<double>();
         gps_std = Vec3d(dop, dop, dop);

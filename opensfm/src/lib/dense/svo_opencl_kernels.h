@@ -18,7 +18,6 @@ namespace dense {
 
 inline const char* kSVOKernelSource =
     R"CL(
-
 // =====================================================================
 // Constants
 // =====================================================================
@@ -156,6 +155,8 @@ void hash_accumulate(__global VoxelSlot* table, uint mask,
     atomic_add(overflow_counter, 1u);
 }
 
+)CL"
+    R"CL(
 // =====================================================================
 // Clear the hash table (one work-item per slot).
 // =====================================================================
@@ -293,6 +294,8 @@ __kernel void svo_integrate(
     if (ray_len * 1.2e-7f >= voxel_size) return;
     ray /= ray_len;
 
+)CL"
+    R"CL(
     float t_start = fmax(0.0f, ray_len - trunc);
     float t_end   = ray_len + trunc;
 
@@ -425,6 +428,8 @@ void count_hash_insert(__global CountSlot* table, uint mask,
     atomic_add(overflow_counter, 1u);
 }
 
+)CL"
+    R"CL(
 // Clear the counting table.
 __kernel void svo_clear_count_table(__global CountSlot* table, uint capacity) {
     uint i = get_global_id(0);
@@ -556,6 +561,8 @@ uint hash_lookup(__global const VoxelSlot* table, uint mask,
     uint my_ab = pack_xy(kx, ky);
     if (my_ab == EMPTY_KEY) return 0xFFFFFFFF;
 
+)CL"
+    R"CL(
     uint h = voxel_hash(kx, ky, kz) & mask;
 
     for (int probe = 0; probe < MAX_PROBES; probe++) {
@@ -695,6 +702,8 @@ __kernel void svo_extract_points(
             }
         }
 
+)CL"
+    R"CL(
         // Atomic output index.
         uint out_idx = atomic_add(out_counter, 1u);
         if (out_idx >= max_output) continue;
@@ -835,6 +844,8 @@ __kernel void svo_extract_fill(
                 float off1 = ((float)s1 + 0.5f) * fine_voxel_size
                              - 0.5f * coarse_voxel_size;
 
+)CL"
+    R"CL(
                 // Compute sub-sample world position.
                 float sx, sy, sz;
                 if (d == 0) {
@@ -970,6 +981,8 @@ float sample_sdf_nearest(
     return (float)table[si].sum_tsdf / (sw * (float)FP_SCALE);
 }
 
+)CL"
+    R"CL(
 float3 compute_sdf_gradient(
     __global const VoxelSlot* table, uint mask,
     float3 p, float inv_vs, float eps, float min_weight_scaled)
@@ -1100,6 +1113,8 @@ void compute_zncc_ref(
             float fdx = (float)ix, fdy = (float)iy;
             float ref_g = gray_from_array(images, samp, ref_cx + fdx, ref_cy + fdy, ref_layer);
 
+)CL"
+    R"CL(
             float r = ref_g - ref_center;            // centered at ref_center
             float w = rp->w_lut[ix*ix + iy*iy];
 
@@ -1230,6 +1245,8 @@ float4 compute_zncc_array(
             float dr = ref_g - ref_center;
             float w = exp(inv_sigma_s2 * (fdx*fdx + fdy*fdy));
 
+)CL"
+    R"CL(
             float r = dr;                  // centered at ref_center
             float s = src_g - src_center;  // centered at src_center
 
@@ -1362,6 +1379,8 @@ __kernel void svo_refine_accumulate(
     x_surface.y = cam->Rinv[3]*diff.x + cam->Rinv[4]*diff.y + cam->Rinv[5]*diff.z;
     x_surface.z = cam->Rinv[6]*diff.x + cam->Rinv[7]*diff.y + cam->Rinv[8]*diff.z;
 
+)CL"
+    R"CL(
     // ---- Surface normal via central-difference SDF gradient ----
     // eps must be >= 1.5*voxel_size so nearest-neighbor samples are guaranteed
     // to land in distinct voxels regardless of sub-voxel position.
@@ -1640,6 +1659,8 @@ __kernel void svo_refine_update(
         }
     }
 
+)CL"
+    R"CL(
     // Nothing moved this voxel (no data gradient, flat neighborhood).
     if (fabs(grad_d) < 1e-10f) return;
 
@@ -1780,6 +1801,8 @@ __kernel void svo_bake_colors(
     float obs_res[36];  // resolution score = fx * cos(theta) / z  (~1/GSD)
     int n_valid = 0;
 
+)CL"
+    R"CL(
     for (int j = 0; j < n_views; j++) {
         __constant SVOCamera* cam_j = &cameras[j];
 
@@ -1912,6 +1935,8 @@ __kernel void svo_bake_colors(
         return;
     }
 
+)CL"
+    R"CL(
     // Single observation: nothing to robustify or select — emit it directly.
     if (n_valid == 1) {
         uchar c0r = (uchar)clamp(obs_r[0] * 255.0f, 0.0f, 255.0f);
@@ -2046,6 +2071,8 @@ __kernel void svo_bake_colors(
         }
     }
 
+)CL"
+    R"CL(
     if (wsum > 1e-8f) {
         out_lin /= wsum;
     } else {
@@ -2196,6 +2223,8 @@ __kernel void svo_raycast_guided(
     int                       view_idx,
     int                       rows,
     int                       cols,
+)CL"
+    R"CL(
     float                     voxel_size,
     float                     inv_voxel_size,
     float                     search_margin,  // world-space half-range
@@ -2330,6 +2359,8 @@ int dc_tsdf(__global const VoxelSlot* table, uint slot, float* out,
     return 1;
 }
 
+)CL"
+    R"CL(
 // Look up a cube's Surface Nets vertex by its min-corner voxel.
 // Returns 1 and fills *out if that cube produced a vertex (z != NaN).
 int dc_vertex_lookup(__global const VoxelSlot* table, uint mask,
@@ -2461,6 +2492,8 @@ void dc_raster_tri(__global int* zbuf, int grid_w, int grid_h,
     // Guard: reject degenerate / oversized triangles (kills stray bridges).
     if ((maxx - minx) > max_tri_cells || (maxy - miny) > max_tri_cells) return;
 
+)CL"
+    R"CL(
     minx = max(minx, 0);
     miny = max(miny, 0);
     maxx = min(maxx, grid_w - 1);
@@ -2595,6 +2628,8 @@ __kernel void svo_dc_finalize(
         return;
     }
 
+)CL"
+    R"CL(
     const float inv_z = 1.0f / DSM_Z_FP;
     dsm_out[cell] = z_min + (float)zi * inv_z;
 
@@ -2737,6 +2772,8 @@ __kernel void svo_dc_resolve(
     z_out[i] = z;
 }
 
+)CL"
+    R"CL(
 // 5x5 median despeckle of the resolved z-buffer.  Ignores empty (-1) cells in
 // the window and never fills holes (an empty cell stays empty), so it removes
 // isolated speckle while preserving real step edges and no-data borders.  The
@@ -2868,6 +2905,8 @@ __kernel void svo_dc_mesh_faces(
     int ky = (int)(key_ab & 0xFFFF) - 32768;
     int kz = table[i].key_c;
 
+)CL"
+    R"CL(
     float tA;
     int wA;
     dc_tsdf(table, i, &tA, &wA);  // present: this slot owns a vertex

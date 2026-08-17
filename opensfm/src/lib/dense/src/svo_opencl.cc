@@ -1409,7 +1409,7 @@ void SVOIntegratorCL::BakeColors(
                           const_cast<uint8_t*>(relax_occ->data()), &err);
     opencl::CheckCL(err, "bake relax buffer");
   } else {
-    cl_relax = cl::Buffer(ctx, CL_MEM_READ_ONLY, 1, nullptr, &err);
+    cl_relax = cl::Buffer(ctx, CL_MEM_READ_ONLY, (size_t)1, (void*)nullptr, &err);
     opencl::CheckCL(err, "bake relax dummy buffer");
   }
 
