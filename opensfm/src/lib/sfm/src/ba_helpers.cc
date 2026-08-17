@@ -39,9 +39,9 @@ bool ArePointsCollinear(const MatX3d& X) {
   return cond1 > 1 || ratio_1st_2nd > epsilon_ratio;
 }
 
-const char* DetermineLinearSolver(size_t num_cameras, size_t num_points,
+const char* DetermineLinearSolver(size_t num_shots, size_t num_points,
                                   size_t num_observations) {
-  if (num_cameras <= 200) {
+  if (num_shots <= 200) {
     return "DENSE_SCHUR";
   } else {
     return "SPARSE_SCHUR";
