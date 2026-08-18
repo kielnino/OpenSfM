@@ -42,7 +42,7 @@ class WhiteningCostFunction : public ceres::CostFunction {
     r = L_inv * r;
 
     if (jacobians) {
-      const int num_params = parameter_block_sizes().size();
+      const int num_params = static_cast<int>(parameter_block_sizes().size());
       for (int i = 0; i < num_params; ++i) {
         if (jacobians[i]) {
           int block_size = parameter_block_sizes()[i];
@@ -207,10 +207,13 @@ std::string IRLSSummary::BriefReport() const {
 
 IRLSSolver::IRLSSolver()
     : problem_(ProblemOptions()),
+      context_(IRLSSolverContext()),
       reweighting_strategy_(std::make_unique<MixtureReweighting>()) {}
 
 IRLSSolver::IRLSSolver(std::unique_ptr<IReweightingStrategy> strategy)
-    : problem_(ProblemOptions()), reweighting_strategy_(std::move(strategy)) {}
+    : problem_(ProblemOptions()), 
+      context_(IRLSSolverContext()),
+      reweighting_strategy_(std::move(strategy)) {}
 
 IRLSSolver::~IRLSSolver() {
   for (auto& [group_id, error_group] : error_groups_) {
@@ -358,7 +361,7 @@ std::vector<GroupWeightResult> IRLSSolver::ComputeWeights() {
     const size_t num_blocks = error_group.residual_block_ids.size();
 
     // Pre-compute sizes and offsets
-    std::vector<int> block_offsets(num_blocks);
+    std::vector<size_t> block_offsets(num_blocks);
     size_t total_residuals = 0;
     for (size_t i = 0; i < num_blocks; ++i) {
       const ceres::ResidualBlockId block_id = error_group.residual_block_ids[i];
